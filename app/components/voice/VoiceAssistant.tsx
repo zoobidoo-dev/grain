@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { z } from "zod";
 import {
@@ -45,7 +45,17 @@ type TranscriptEntry = {
   text: string;
 };
 
+type VoiceConnectionPhase = "idle" | "connecting" | "connected" | "closing" | "failed";
+
 type AssistantContext = Awaited<ReturnType<typeof buildAssistantContext>>;
+
+const CONNECT_RETRY_DELAYS_MS = [400, 1200, 2500];
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 function getRealtimeText(item: RealtimeItem) {
   if (item.type !== "message") return "";
@@ -209,14 +219,15 @@ export function VoiceAssistant() {
   const openRef = useRef(false);
   const pendingTransactionRef = useRef<PendingTransactionDraft>({});
   const [open, setOpen] = useState(false);
-  const [processing, setProcessing] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
-  const [connected, setConnected] = useState(false);
   const [apiKeyAvailable, setApiKeyAvailable] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
+  const [connectionPhase, setConnectionPhase] = useState<VoiceConnectionPhase>("idle");
   const [pendingTransaction, setPendingTransaction] = useState<PendingTransactionDraft>({});
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const connected = connectionPhase === "connected";
+  const processing = connectionPhase === "connecting" || connectionPhase === "closing";
 
   useEffect(() => {
     openRef.current = open;
@@ -273,13 +284,16 @@ export function VoiceAssistant() {
     setTranscript(nextTranscript.slice(-10));
   }
 
-  function teardownRealtimeSession(options?: { clearTranscript?: boolean; clearError?: boolean }) {
+  function teardownRealtimeSession(options?: {
+    clearTranscript?: boolean;
+    clearError?: boolean;
+    nextPhase?: VoiceConnectionPhase;
+  }) {
     sessionGenerationRef.current += 1;
     const session = sessionRef.current;
     sessionRef.current = null;
+    setConnectionPhase(options?.nextPhase ?? "idle");
     session?.close();
-    setConnected(false);
-    setProcessing(false);
     if (options?.clearTranscript ?? true) {
       setTranscript([]);
     }
@@ -294,118 +308,120 @@ export function VoiceAssistant() {
     const apiKey = getStoredVoiceApiKey();
     if (!apiKey) {
       setError("Add your OpenAI API key in Settings to use voice assistant.");
+      setConnectionPhase("failed");
       return;
     }
 
-    setProcessing(true);
     setError("");
-    setConnected(false);
+    setConnectionPhase("connecting");
 
-    let session: RealtimeSession | null = null;
-    try {
-      const initialContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
+    for (let attempt = 0; attempt < CONNECT_RETRY_DELAYS_MS.length + 1; attempt += 1) {
       if (sessionGeneration !== sessionGenerationRef.current || !openRef.current) return;
+      let session: RealtimeSession | null = null;
+      try {
+        const initialContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
+        if (sessionGeneration !== sessionGenerationRef.current || !openRef.current) return;
 
-      const updateDraftTool = tool({
-        name: "update_transaction_draft",
-        description:
-          "Update any known transaction draft fields from the user's latest speech. Use this whenever the user provides or corrects amount, type, category, wallet, date, or note.",
-        parameters: z.object({
-          amount: z.number().positive().optional(),
-          type: z.enum(["income", "expense"]).optional(),
-          categoryId: z.string().optional(),
-          walletId: z.string().optional(),
-          createdAt: z.string().optional(),
-          note: z.string().optional(),
-          awaitingConfirmation: z.boolean().optional(),
-          clearDraft: z.boolean().optional(),
-        }),
-        execute: async (input) => {
-          if (input.clearDraft) {
+        const updateDraftTool = tool({
+          name: "update_transaction_draft",
+          description:
+            "Update any known transaction draft fields from the user's latest speech. Use this whenever the user provides or corrects amount, type, category, wallet, date, or note.",
+          parameters: z.object({
+            amount: z.number().positive().optional(),
+            type: z.enum(["income", "expense"]).optional(),
+            categoryId: z.string().optional(),
+            walletId: z.string().optional(),
+            createdAt: z.string().optional(),
+            note: z.string().optional(),
+            awaitingConfirmation: z.boolean().optional(),
+            clearDraft: z.boolean().optional(),
+          }),
+          execute: async (input) => {
+            if (input.clearDraft) {
+              setPendingTransaction({});
+              pendingTransactionRef.current = {};
+              return "Transaction draft cleared.";
+            }
+
+            const nextDraft: PendingTransactionDraft = {
+              ...pendingTransactionRef.current,
+              ...Object.fromEntries(
+                Object.entries(input).filter(([, value]) => value !== undefined),
+              ),
+            };
+            delete (nextDraft as { clearDraft?: boolean }).clearDraft;
+            const liveContext = await buildAssistantContext(pathname, nextDraft);
+            const missing = missingDraftFields(nextDraft, liveContext);
+            const updatedDraft: PendingTransactionDraft = {
+              ...nextDraft,
+              awaitingConfirmation: missing.length === 0 ? true : undefined,
+            };
+            if (!updatedDraft.awaitingConfirmation) {
+              delete updatedDraft.awaitingConfirmation;
+            }
+            setPendingTransaction(updatedDraft);
+            pendingTransactionRef.current = updatedDraft;
+            return missing.length
+              ? `Draft updated. Missing ${missing.join(", ")}.`
+              : `Draft updated: ${formatDraftSummary(updatedDraft, liveContext)}.`;
+          },
+        });
+
+        const getSnapshotTool = tool({
+          name: "get_finance_snapshot",
+          description:
+            "Get current finance context, including categories, wallets, pending transaction draft, and current month summary before asking follow-up questions.",
+          parameters: z.object({}),
+          execute: async () => {
+            const context = await buildAssistantContext(pathname, pendingTransactionRef.current);
+            return JSON.stringify(context);
+          },
+        });
+
+        const saveDraftTool = tool({
+          name: "save_transaction_draft",
+          description:
+            "Save the current transaction draft only after the user explicitly confirms with yes, sure, okay, go ahead, save it, haan, or similar.",
+          parameters: z.object({}),
+          execute: async () => {
+            const liveContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
+            const currentDraft = pendingTransactionRef.current;
+            if (!validateDraft(currentDraft, liveContext)) {
+              return `Cannot save yet. Missing ${missingDraftFields(currentDraft, liveContext).join(", ")}.`;
+            }
+            await addTransaction({
+              amount: currentDraft.amount!,
+              type: currentDraft.type!,
+              categoryId: currentDraft.categoryId!,
+              walletId: currentDraft.walletId!,
+              createdAt: currentDraft.createdAt,
+              note: currentDraft.note,
+            });
+            const summary = formatDraftSummary(currentDraft, liveContext);
             setPendingTransaction({});
             pendingTransactionRef.current = {};
-            return "Transaction draft cleared.";
-          }
+            router.push("/transactions");
+            return `Saved ${summary}.`;
+          },
+        });
 
-          const nextDraft: PendingTransactionDraft = {
-            ...pendingTransactionRef.current,
-            ...Object.fromEntries(
-              Object.entries(input).filter(([, value]) => value !== undefined),
-            ),
-          };
-          delete (nextDraft as { clearDraft?: boolean }).clearDraft;
-          const liveContext = await buildAssistantContext(pathname, nextDraft);
-          const missing = missingDraftFields(nextDraft, liveContext);
-          const updatedDraft: PendingTransactionDraft = {
-            ...nextDraft,
-            awaitingConfirmation: missing.length === 0 ? true : undefined,
-          };
-          if (!updatedDraft.awaitingConfirmation) {
-            delete updatedDraft.awaitingConfirmation;
-          }
-          setPendingTransaction(updatedDraft);
-          pendingTransactionRef.current = updatedDraft;
-          return missing.length
-            ? `Draft updated. Missing ${missing.join(", ")}.`
-            : `Draft updated: ${formatDraftSummary(updatedDraft, liveContext)}.`;
-        },
-      });
+        const navigateTool = tool({
+          name: "navigate_app",
+          description:
+            "Navigate the app to a supported route after answering a history or insights request.",
+          parameters: z.object({
+            path: z.enum(["/", "/transactions", "/insights", "/budgets", "/settings"]),
+          }),
+          execute: async ({ path }) => {
+            router.push(path);
+            return `Navigated to ${path}.`;
+          },
+        });
 
-      const getSnapshotTool = tool({
-        name: "get_finance_snapshot",
-        description:
-          "Get current finance context, including categories, wallets, pending transaction draft, and current month summary before asking follow-up questions.",
-        parameters: z.object({}),
-        execute: async () => {
-          const context = await buildAssistantContext(pathname, pendingTransactionRef.current);
-          return JSON.stringify(context);
-        },
-      });
-
-      const saveDraftTool = tool({
-        name: "save_transaction_draft",
-        description:
-          "Save the current transaction draft only after the user explicitly confirms with yes, sure, okay, go ahead, save it, haan, or similar.",
-        parameters: z.object({}),
-        execute: async () => {
-          const liveContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
-          const currentDraft = pendingTransactionRef.current;
-          if (!validateDraft(currentDraft, liveContext)) {
-            return `Cannot save yet. Missing ${missingDraftFields(currentDraft, liveContext).join(", ")}.`;
-          }
-          await addTransaction({
-            amount: currentDraft.amount!,
-            type: currentDraft.type!,
-            categoryId: currentDraft.categoryId!,
-            walletId: currentDraft.walletId!,
-            createdAt: currentDraft.createdAt,
-            note: currentDraft.note,
-          });
-          const summary = formatDraftSummary(currentDraft, liveContext);
-          setPendingTransaction({});
-          pendingTransactionRef.current = {};
-          router.push("/transactions");
-          return `Saved ${summary}.`;
-        },
-      });
-
-      const navigateTool = tool({
-        name: "navigate_app",
-        description:
-          "Navigate the app to a supported route after answering a history or insights request.",
-        parameters: z.object({
-          path: z.enum(["/", "/transactions", "/insights", "/budgets", "/settings"]),
-        }),
-        execute: async ({ path }) => {
-          router.push(path);
-          return `Navigated to ${path}.`;
-        },
-      });
-
-      const agent = new RealtimeAgent({
-        name: "Grain Voice",
-        voice: "alloy",
-        instructions: `You are Grain Voice, a production-quality finance voice assistant for a personal finance tracker.
+        const agent = new RealtimeAgent({
+          name: "Grain Voice",
+          voice: "alloy",
+          instructions: `You are Grain Voice, a production-quality finance voice assistant for a personal finance tracker.
 
 You must handle:
 - broken English
@@ -430,76 +446,83 @@ Available wallets: ${initialContext.wallets
           .map((wallet) => `${wallet.name} (${wallet.id})`)
           .join(", ")}
 Current month summary: income ${initialContext.monthlySummary.income}, expenses ${initialContext.monthlySummary.expenses}, net ${initialContext.monthlySummary.net}.`,
-        tools: [updateDraftTool, getSnapshotTool, saveDraftTool, navigateTool],
-      });
+          tools: [updateDraftTool, getSnapshotTool, saveDraftTool, navigateTool],
+        });
 
-      session = new RealtimeSession(agent, {
-        model: "gpt-realtime",
-        transport: "webrtc",
-        config: {
-          audio: {
-            input: {
-              transcription: {
-                language: voiceLanguage,
-                model: "gpt-4o-mini-transcribe",
+        session = new RealtimeSession(agent, {
+          model: "gpt-realtime",
+          transport: "webrtc",
+          config: {
+            audio: {
+              input: {
+                transcription: {
+                  language: voiceLanguage,
+                  model: "gpt-4o-mini-transcribe",
+                },
+                turnDetection: {
+                  type: "server_vad",
+                  createResponse: true,
+                  interruptResponse: true,
+                  silenceDurationMs: 250,
+                },
               },
-              turnDetection: {
-                type: "server_vad",
-                createResponse: true,
-                interruptResponse: true,
-                silenceDurationMs: 250,
+              output: {
+                voice: "alloy",
+                speed: 1,
               },
-            },
-            output: {
-              voice: "alloy",
-              speed: 1,
             },
           },
-        },
-      });
+        });
 
-      sessionRef.current = session;
+        sessionRef.current = session;
 
-      const isCurrentSession = () =>
-        sessionRef.current === session &&
-        sessionGenerationRef.current === sessionGeneration &&
-        openRef.current;
+        const isCurrentSession = () =>
+          sessionRef.current === session &&
+          sessionGenerationRef.current === sessionGeneration &&
+          openRef.current;
 
-      session.on("history_updated", (history) => {
-        if (!isCurrentSession()) return;
-        void syncTranscriptFromHistory(history);
-      });
-      session.on("error", (nextError) => {
-        if (!isCurrentSession()) return;
-        teardownRealtimeSession({ clearTranscript: false, clearError: false });
-        setError(
-          nextError.error instanceof Error
-            ? nextError.error.message
-            : "Realtime voice session failed.",
-        );
-      });
+        session.on("history_updated", (history) => {
+          if (!isCurrentSession()) return;
+          void syncTranscriptFromHistory(history);
+        });
+        session.on("error", (nextError) => {
+          if (!isCurrentSession()) return;
+          teardownRealtimeSession({ clearTranscript: false, clearError: false, nextPhase: "failed" });
+          setError(
+            nextError.error instanceof Error
+              ? nextError.error.message
+              : "Realtime voice session failed.",
+          );
+        });
 
-      const clientSecret = await mintRealtimeClientSecret(apiKey);
-      if (!isCurrentSession()) {
-        session.close();
+        const clientSecret = await mintRealtimeClientSecret(apiKey);
+        if (!isCurrentSession()) {
+          session.close();
+          return;
+        }
+        await session.connect({ apiKey: clientSecret, model: "gpt-realtime" });
+        if (!isCurrentSession()) {
+          session.close();
+          return;
+        }
+        setConnectionPhase("connected");
         return;
-      }
-      await session.connect({ apiKey: clientSecret, model: "gpt-realtime" });
-      if (!isCurrentSession()) {
-        session.close();
-        return;
-      }
-      setConnected(true);
-    } catch (nextError) {
-      if (sessionGeneration === sessionGenerationRef.current) {
+      } catch (nextError) {
+        session?.close();
+        if (sessionRef.current === session) {
+          sessionRef.current = null;
+        }
+        const stillActive = sessionGeneration === sessionGenerationRef.current && openRef.current;
+        if (!stillActive) return;
+        if (attempt < CONNECT_RETRY_DELAYS_MS.length) {
+          setConnectionPhase("connecting");
+          setError("Connection failed. Retrying...");
+          await sleep(CONNECT_RETRY_DELAYS_MS[attempt]);
+          continue;
+        }
+        setConnectionPhase("failed");
         setError(nextError instanceof Error ? nextError.message : "Could not start voice session.");
-      }
-      session?.close();
-      sessionRef.current = null;
-      setConnected(false);
-    } finally {
-      if (sessionGeneration === sessionGenerationRef.current) {
-        setProcessing(false);
+        return;
       }
     }
   }, [pathname, router, voiceLanguage]);
@@ -508,13 +531,17 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
     teardownRealtimeSession({ clearTranscript: true, clearError: true });
   }, []);
 
-  useEffect(() => {
-    if (open) {
+  const syncVoiceSession = useEffectEvent(() => {
+    if (openRef.current) {
       void connectRealtime();
       return;
     }
     closeRealtime();
-  }, [open, closeRealtime, connectRealtime]);
+  });
+
+  useEffect(() => {
+    syncVoiceSession();
+  }, [open]);
 
   async function sendTypedMessage() {
     const message = draft.trim();
