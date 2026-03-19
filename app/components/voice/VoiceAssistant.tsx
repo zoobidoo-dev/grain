@@ -21,6 +21,7 @@ import {
   getWallets,
 } from "@/lib/db";
 import { monthKey, summarizeTransactions } from "@/lib/finance";
+import { formatRealtimeVoiceError } from "@/lib/voice-errors";
 import {
   getStoredVoiceApiKey,
   getStoredVoiceLanguage,
@@ -488,11 +489,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         session.on("error", (nextError) => {
           if (!isCurrentSession()) return;
           teardownRealtimeSession({ clearTranscript: false, clearError: false, nextPhase: "failed" });
-          setError(
-            nextError.error instanceof Error
-              ? nextError.error.message
-              : "Realtime voice session failed.",
-          );
+          setError(formatRealtimeVoiceError(nextError.error));
         });
 
         const clientSecret = await mintRealtimeClientSecret(apiKey);
@@ -516,12 +513,12 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         if (!stillActive) return;
         if (attempt < CONNECT_RETRY_DELAYS_MS.length) {
           setConnectionPhase("connecting");
-          setError("Connection failed. Retrying...");
+          setError(formatRealtimeVoiceError(nextError));
           await sleep(CONNECT_RETRY_DELAYS_MS[attempt]);
           continue;
         }
         setConnectionPhase("failed");
-        setError(nextError instanceof Error ? nextError.message : "Could not start voice session.");
+        setError(formatRealtimeVoiceError(nextError));
         return;
       }
     }
