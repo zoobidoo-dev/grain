@@ -18,7 +18,7 @@ import {
   getWallets,
 } from "@/lib/db";
 import { categoryLabelMap, groupByDate, parseSmartQuery } from "@/lib/finance";
-import { formatCurrency, formatDate } from "@/lib/format";
+import { formatCurrency, formatDate, searchableDateTerms } from "@/lib/format";
 import type {
   Category,
   Preferences,
@@ -118,8 +118,9 @@ export default function TransactionsPage() {
       if (!search.trim()) return true;
       const amount = String(tx.amount);
       const note = (tx.note ?? "").toLowerCase();
+      const dateTerms = searchableDateTerms(tx.createdAt, preferences.locale);
       return smartQuery.text.every((query) =>
-        [categoryLabel, walletLabel, amount, note].some((field) =>
+        [categoryLabel, walletLabel, amount, note, ...dateTerms].some((field) =>
           field.includes(query),
         ),
       );
@@ -133,6 +134,7 @@ export default function TransactionsPage() {
     search,
     categoryMap,
     walletMap,
+    preferences.locale,
     minAmount,
     maxAmount,
   ]);
