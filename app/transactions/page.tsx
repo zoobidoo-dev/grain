@@ -105,6 +105,18 @@ export default function TransactionsPage() {
       if (Number.isFinite(min) && minAmount && tx.amount < min) return false;
       if (Number.isFinite(max) && maxAmount && tx.amount > max) return false;
 
+      const txDate = new Date(tx.createdAt);
+      if (
+        smartQuery.month !== undefined &&
+        txDate.getMonth() !== smartQuery.month
+      )
+        return false;
+      if (
+        smartQuery.year !== undefined &&
+        txDate.getFullYear() !== smartQuery.year
+      )
+        return false;
+
       if (smartQuery.type && tx.type !== smartQuery.type) return false;
       const categoryLabel = (categoryMap.get(tx.categoryId) ?? "").toLowerCase();
       const walletLabel = (walletMap.get(tx.walletId) ?? "").toLowerCase();

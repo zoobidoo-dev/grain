@@ -202,22 +202,54 @@ type SmartQuery = {
   type?: "income" | "expense";
   min?: number;
   max?: number;
+  month?: number;
+  year?: number;
 };
+
+const MONTH_ALIASES = new Map<string, number>(
+  [
+    ["jan", "january"],
+    ["feb", "february"],
+    ["mar", "march"],
+    ["apr", "april"],
+    ["may", "may"],
+    ["jun", "june"],
+    ["jul", "july"],
+    ["aug", "august"],
+    ["sep", "september"],
+    ["oct", "october"],
+    ["nov", "november"],
+    ["dec", "december"],
+  ]
+    .flatMap((names, index) => names.map((name) => [name, index]))
+    .map(([name, index]) => [name, index] as [string, number]),
+);
+
+function parseMonthToken(value: string) {
+  const normalized = value.toLowerCase().replace(/[^a-z]/g, "");
+  if (!normalized) return undefined;
+  return MONTH_ALIASES.get(normalized);
+}
+
+function sanitizeToken(value: string) {
+  return value.toLowerCase().replace(/[.,]/g, "");
+}
 
 export function parseSmartQuery(input: string): SmartQuery {
   const tokens = input.trim().split(/\s+/).filter(Boolean);
   const parsed: SmartQuery = { text: [] };
-  for (const token of tokens) {
+  for (const rawToken of tokens) {
+    const token = rawToken.toLowerCase();
     if (token.startsWith("cat:")) {
-      parsed.category = token.slice(4).toLowerCase();
+      parsed.category = sanitizeToken(token.slice(4));
       continue;
     }
     if (token.startsWith("wallet:")) {
-      parsed.wallet = token.slice(7).toLowerCase();
+      parsed.wallet = sanitizeToken(token.slice(7));
       continue;
     }
     if (token.startsWith("type:")) {
-      const value = token.slice(5).toLowerCase();
+      const value = sanitizeToken(token.slice(5));
       if (value === "income" || value === "expense") parsed.type = value;
       continue;
     }
@@ -231,7 +263,30 @@ export function parseSmartQuery(input: string): SmartQuery {
       if (Number.isFinite(value)) parsed.max = value;
       continue;
     }
-    parsed.text.push(token.toLowerCase());
+    if (token.startsWith("month:")) {
+      const month = parseMonthToken(token.slice(6));
+      if (month !== undefined) {
+        parsed.month = month;
+        continue;
+      }
+    }
+    if (token.startsWith("year:")) {
+      const value = Number(token.slice(5));
+      if (Number.isFinite(value)) {
+        parsed.year = value;
+        continue;
+      }
+    }
+    if (token.length === 4 && /^\d{4}$/.test(token)) {
+      parsed.year = Number(token);
+      continue;
+    }
+    const month = parseMonthToken(token);
+    if (month !== undefined) {
+      parsed.month = month;
+      continue;
+    }
+    parsed.text.push(token);
   }
   return parsed;
 }

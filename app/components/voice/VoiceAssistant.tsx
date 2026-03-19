@@ -302,13 +302,20 @@ export function VoiceAssistant() {
             ),
           };
           delete (nextDraft as { clearDraft?: boolean }).clearDraft;
-          setPendingTransaction(nextDraft);
-          pendingTransactionRef.current = nextDraft;
           const liveContext = await buildAssistantContext(pathname, nextDraft);
           const missing = missingDraftFields(nextDraft, liveContext);
+          const updatedDraft: PendingTransactionDraft = {
+            ...nextDraft,
+            awaitingConfirmation: missing.length === 0 ? true : undefined,
+          };
+          if (!updatedDraft.awaitingConfirmation) {
+            delete updatedDraft.awaitingConfirmation;
+          }
+          setPendingTransaction(updatedDraft);
+          pendingTransactionRef.current = updatedDraft;
           return missing.length
             ? `Draft updated. Missing ${missing.join(", ")}.`
-            : `Draft updated: ${formatDraftSummary(nextDraft, liveContext)}.`;
+            : `Draft updated: ${formatDraftSummary(updatedDraft, liveContext)}.`;
         },
       });
 
