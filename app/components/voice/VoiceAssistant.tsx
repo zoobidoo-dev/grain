@@ -15,25 +15,39 @@ import {
 import { monthKey, summarizeTransactions } from "@/lib/finance";
 import {
   getStoredVoiceApiKey,
+  getStoredVoiceLanguage,
+  VOICE_LANGUAGE_EVENT,
   VOICE_API_KEY_EVENT,
 } from "@/lib/voice-settings";
 import type { TransactionType } from "@/lib/types";
 
 type VoiceAgentResponse = {
   reply: string;
-  action: {
-    type: "none" | "navigate" | "add_transaction";
-    path?: string;
-    transaction?: {
-      amount: number;
-      type: TransactionType;
-      categoryId: string;
-      walletId: string;
-      createdAt?: string;
-      note?: string;
-    };
+  updates?: {
+    amount?: number;
+    type?: TransactionType;
+    categoryId?: string;
+    walletId?: string;
+    createdAt?: string;
+    note?: string;
   };
+  requiresConfirmation?: boolean;
+  shouldSave?: boolean;
+  clearDraft?: boolean;
+  navigatePath?: string;
 };
+
+type PendingTransactionDraft = {
+  amount?: number;
+  type?: TransactionType;
+  categoryId?: string;
+  walletId?: string;
+  createdAt?: string;
+  note?: string;
+  awaitingConfirmation?: boolean;
+};
+
+type AssistantContext = Awaited<ReturnType<typeof buildAssistantContext>>;
 
 type TranscriptEntry = {
   id: string;
@@ -71,6 +85,112 @@ function getSpeechRecognitionConstructor() {
   return browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition ?? null;
 }
 
+async function buildAssistantContext(pathname: string, pendingTransaction: PendingTransactionDraft) {
+  const [transactions, categories, wallets, preferences] = await Promise.all([
+    getTransactions(),
+    getCategories(),
+    getWallets(),
+    getPreferences(),
+  ]);
+
+  const currentMonth = monthKey();
+  const monthlySummary = summarizeTransactions(
+    transactions.filter((item) => item.createdAt.slice(0, 7) === currentMonth),
+  );
+  const categoryMap = new Map(categories.map((category) => [category.id, category.name]));
+  const walletMap = new Map(wallets.map((wallet) => [wallet.id, wallet.name]));
+
+  return {
+    currentDate: new Date().toISOString(),
+    currentPath: pathname,
+    preferences: {
+      locale: preferences.locale,
+      currency: preferences.currency,
+    },
+    categories: categories
+      .filter((category) => !category.archived)
+      .map((category) => ({ id: category.id, name: category.name })),
+    wallets: wallets.map((wallet) => ({
+      id: wallet.id,
+      name: wallet.name,
+      type: wallet.type,
+    })),
+    monthlySummary,
+    pendingTransaction,
+    recentTransactions: transactions.slice(0, 25).map((transaction) => ({
+      createdAt: transaction.createdAt,
+      amount: transaction.amount,
+      type: transaction.type,
+      category: categoryMap.get(transaction.categoryId) ?? "Unknown",
+      wallet: walletMap.get(transaction.walletId) ?? "Unknown",
+      note: transaction.note,
+    })),
+  };
+}
+
+function yesIntent(text: string) {
+  return /^(yes|yeah|yep|haan|han|ha|ok|okay|save|confirm|kar do|haan save|yes save)\b/i.test(
+    text.trim(),
+  );
+}
+
+function noIntent(text: string) {
+  return /^(no|nah|cancel|stop|mat karo|don't save|dont save)\b/i.test(text.trim());
+}
+
+function missingDraftFields(
+  draft: PendingTransactionDraft,
+  context: AssistantContext,
+) {
+  const missing: string[] = [];
+  if (!draft.amount) missing.push("amount");
+  if (!draft.type) missing.push("type");
+  if (!draft.categoryId) missing.push("category");
+  if (!draft.walletId) missing.push("wallet");
+  if (!draft.createdAt) missing.push("date");
+
+  if (missing.length === 0) return [];
+
+  return missing.map((field) => {
+    if (field === "wallet") {
+      const walletNames = context.wallets.slice(0, 5).map((wallet) => wallet.name).join(", ");
+      return `wallet (${walletNames})`;
+    }
+    if (field === "category") {
+      const categoryNames = context.categories
+        .slice(0, 5)
+        .map((category) => category.name)
+        .join(", ");
+      return `category (${categoryNames})`;
+    }
+    return field;
+  });
+}
+
+function formatDraftSummary(draft: PendingTransactionDraft, context: AssistantContext) {
+  const categoryName =
+    context.categories.find((category) => category.id === draft.categoryId)?.name ?? "Unknown";
+  const walletName =
+    context.wallets.find((wallet) => wallet.id === draft.walletId)?.name ?? "Unknown";
+  const dateText = draft.createdAt ? new Date(draft.createdAt).toLocaleDateString() : "today";
+  return `${draft.type ?? "transaction"} ${draft.amount ?? ""} in ${categoryName} from ${walletName} on ${dateText}`;
+}
+
+function validateDraft(
+  draft: PendingTransactionDraft,
+  context: AssistantContext,
+) {
+  if (!draft.amount || draft.amount <= 0) return false;
+  if (draft.type !== "income" && draft.type !== "expense") return false;
+  if (!draft.categoryId || !context.categories.some((item) => item.id === draft.categoryId)) {
+    return false;
+  }
+  if (!draft.walletId || !context.wallets.some((item) => item.id === draft.walletId)) {
+    return false;
+  }
+  return true;
+}
+
 export function VoiceAssistant() {
   const router = useRouter();
   const pathname = usePathname();
@@ -81,6 +201,8 @@ export function VoiceAssistant() {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
   const [apiKeyAvailable, setApiKeyAvailable] = useState(false);
+  const [voiceLanguage, setVoiceLanguage] = useState("en-US");
+  const [pendingTransaction, setPendingTransaction] = useState<PendingTransactionDraft>({});
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionSupported = Boolean(getSpeechRecognitionConstructor());
   const speechSupported =
@@ -91,11 +213,18 @@ export function VoiceAssistant() {
       setApiKeyAvailable(Boolean(getStoredVoiceApiKey()));
     }
 
+    function refreshVoiceLanguage() {
+      setVoiceLanguage(getStoredVoiceLanguage());
+    }
+
     refreshApiKeyState();
+    refreshVoiceLanguage();
     window.addEventListener(VOICE_API_KEY_EVENT, refreshApiKeyState);
+    window.addEventListener(VOICE_LANGUAGE_EVENT, refreshVoiceLanguage);
     window.addEventListener("storage", refreshApiKeyState);
     return () => {
       window.removeEventListener(VOICE_API_KEY_EVENT, refreshApiKeyState);
+      window.removeEventListener(VOICE_LANGUAGE_EVENT, refreshVoiceLanguage);
       window.removeEventListener("storage", refreshApiKeyState);
     };
   }, []);
@@ -116,45 +245,16 @@ export function VoiceAssistant() {
     window.speechSynthesis.speak(utterance);
   }
 
-  async function buildContext() {
-    const [transactions, categories, wallets, preferences] = await Promise.all([
-      getTransactions(),
-      getCategories(),
-      getWallets(),
-      getPreferences(),
-    ]);
-
-    const currentMonth = monthKey();
-    const monthlySummary = summarizeTransactions(
-      transactions.filter((item) => item.createdAt.slice(0, 7) === currentMonth),
-    );
-    const categoryMap = new Map(categories.map((category) => [category.id, category.name]));
-    const walletMap = new Map(wallets.map((wallet) => [wallet.id, wallet.name]));
-
+  function mergeDraft(
+    current: PendingTransactionDraft,
+    updates: VoiceAgentResponse["updates"],
+  ): PendingTransactionDraft {
+    if (!updates) return current;
     return {
-      currentDate: new Date().toISOString(),
-      currentPath: pathname,
-      preferences: {
-        locale: preferences.locale,
-        currency: preferences.currency,
-      },
-      categories: categories
-        .filter((category) => !category.archived)
-        .map((category) => ({ id: category.id, name: category.name })),
-      wallets: wallets.map((wallet) => ({
-        id: wallet.id,
-        name: wallet.name,
-        type: wallet.type,
-      })),
-      monthlySummary,
-      recentTransactions: transactions.slice(0, 25).map((transaction) => ({
-        createdAt: transaction.createdAt,
-        amount: transaction.amount,
-        type: transaction.type,
-        category: categoryMap.get(transaction.categoryId) ?? "Unknown",
-        wallet: walletMap.get(transaction.walletId) ?? "Unknown",
-        note: transaction.note,
-      })),
+      ...current,
+      ...Object.fromEntries(
+        Object.entries(updates).filter(([, value]) => value !== undefined),
+      ),
     };
   }
 
@@ -175,7 +275,48 @@ export function VoiceAssistant() {
     ]);
 
     try {
-      const context = await buildContext();
+      const context = await buildAssistantContext(pathname, pendingTransaction);
+
+      if (pendingTransaction.awaitingConfirmation) {
+        if (yesIntent(utterance)) {
+          if (!validateDraft(pendingTransaction, context)) {
+            throw new Error("Draft is incomplete. Complete the missing fields first.");
+          }
+          await addTransaction({
+            amount: pendingTransaction.amount!,
+            type: pendingTransaction.type!,
+            categoryId: pendingTransaction.categoryId!,
+            walletId: pendingTransaction.walletId!,
+            createdAt: pendingTransaction.createdAt,
+            note: pendingTransaction.note,
+          });
+          const reply = `Saved ${formatDraftSummary(pendingTransaction, context)}.`;
+          setPendingTransaction({});
+          setTranscript((current) => [
+            ...current,
+            { id: crypto.randomUUID(), role: "assistant", text: reply },
+          ]);
+          speak(reply);
+          setDraft("");
+          router.push("/transactions");
+          return;
+        }
+
+        if (noIntent(utterance)) {
+          const reply = "Okay, I did not save it. You can continue editing the draft.";
+          setPendingTransaction((current) => ({
+            ...current,
+            awaitingConfirmation: false,
+          }));
+          setTranscript((current) => [
+            ...current,
+            { id: crypto.randomUUID(), role: "assistant", text: reply },
+          ]);
+          speak(reply);
+          return;
+        }
+      }
+
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -190,11 +331,16 @@ export function VoiceAssistant() {
             {
               role: "system",
               content:
-                'You are Grain Voice, a finance voice assistant inside a personal finance tracker. Return ONLY valid JSON with this shape: {"reply": string, "action": {"type":"none"|"navigate"|"add_transaction","path"?:string,"transaction"?:{"amount":number,"type":"income"|"expense","categoryId":string,"walletId":string,"createdAt"?:string,"note"?:string}}}. Use the provided category and wallet ids exactly. Ask short follow-up questions if data is missing.',
+                'You are Grain Voice, a finance voice assistant inside a personal finance tracker. Understand broken English, pauses, partial sentences, and user corrections. Maintain and fill a transaction draft instead of starting over each turn. Reply in the same language as the user when possible. Return ONLY valid JSON with this shape: {"reply": string, "updates"?: {"amount"?: number, "type"?: "income"|"expense", "categoryId"?: string, "walletId"?: string, "createdAt"?: string, "note"?: string}, "requiresConfirmation"?: boolean, "shouldSave"?: boolean, "clearDraft"?: boolean, "navigatePath"?: string}. Use the provided category and wallet ids exactly. Ask only for missing fields. If the user corrects a previous field, overwrite it in updates. Save only after explicit confirmation or a very clear save intent.',
             },
             {
               role: "user",
-              content: JSON.stringify({ utterance, context }),
+              content: JSON.stringify({
+                utterance,
+                language: voiceLanguage,
+                context,
+                recentTranscript: transcript.slice(-6),
+              }),
             },
           ],
         }),
@@ -216,13 +362,46 @@ export function VoiceAssistant() {
           ? (JSON.parse(rawPayload.choices?.[0]?.message?.content ?? "{}") as VoiceAgentResponse)
           : (rawPayload as VoiceAgentResponse);
 
-      if (payload.action.type === "add_transaction" && payload.action.transaction) {
-        await addTransaction(payload.action.transaction);
+      const nextDraft = mergeDraft(pendingTransaction, payload.updates);
+      const draftWithFlags = {
+        ...nextDraft,
+        awaitingConfirmation: payload.requiresConfirmation && validateDraft(nextDraft, context),
+      };
+
+      if (payload.clearDraft) {
+        setPendingTransaction({});
+      } else {
+        setPendingTransaction(draftWithFlags);
       }
 
-      if (payload.action.type === "navigate" && payload.action.path) {
-        router.push(payload.action.path);
-      } else if (payload.action.type === "add_transaction") {
+      if (payload.shouldSave && validateDraft(nextDraft, context)) {
+        await addTransaction({
+          amount: nextDraft.amount!,
+          type: nextDraft.type!,
+          categoryId: nextDraft.categoryId!,
+          walletId: nextDraft.walletId!,
+          createdAt: nextDraft.createdAt,
+          note: nextDraft.note,
+        });
+        setPendingTransaction({});
+      } else if (!payload.shouldSave && !payload.clearDraft) {
+        const missing = missingDraftFields(draftWithFlags, context);
+        if (missing.length && payload.reply.trim().length < 6) {
+          payload.reply = `I have some details. Tell me the missing ${missing.join(", ")}.`;
+        } else if (
+          validateDraft(draftWithFlags, context) &&
+          !draftWithFlags.awaitingConfirmation &&
+          !payload.navigatePath
+        ) {
+          draftWithFlags.awaitingConfirmation = true;
+          setPendingTransaction(draftWithFlags);
+          payload.reply = `I understood ${formatDraftSummary(draftWithFlags, context)}. Say yes to save or tell me what to change.`;
+        }
+      }
+
+      if (payload.navigatePath) {
+        router.push(payload.navigatePath);
+      } else if (payload.shouldSave && validateDraft(nextDraft, context)) {
         router.push("/transactions");
       }
 
@@ -254,7 +433,7 @@ export function VoiceAssistant() {
 
     recognitionRef.current?.stop();
     const recognition = new RecognitionConstructor();
-    recognition.lang = "en-US";
+    recognition.lang = voiceLanguage || "en-US";
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.onresult = (event) => {
@@ -352,6 +531,28 @@ export function VoiceAssistant() {
               </p>
             ) : null}
             {error ? <p className="text-sm text-[var(--danger)]">{error}</p> : null}
+          </Card>
+
+          <Card className="space-y-2">
+            <p className="text-xs text-[var(--muted)]">Current Draft</p>
+            <p className="text-sm">Amount: {pendingTransaction.amount ?? "Pending"}</p>
+            <p className="text-sm">Type: {pendingTransaction.type ?? "Pending"}</p>
+            <p className="text-sm">Category: {pendingTransaction.categoryId ?? "Pending"}</p>
+            <p className="text-sm">Wallet: {pendingTransaction.walletId ?? "Pending"}</p>
+            <p className="text-sm">Date: {pendingTransaction.createdAt ?? "Pending"}</p>
+            <p className="text-sm">Note: {pendingTransaction.note ?? "Optional"}</p>
+            {pendingTransaction.awaitingConfirmation ? (
+              <p className="text-xs text-[var(--muted)]">
+                Waiting for your confirmation before saving.
+              </p>
+            ) : null}
+            <Button
+              variant="secondary"
+              className="w-full"
+              onClick={() => setPendingTransaction({})}
+            >
+              Clear Draft
+            </Button>
           </Card>
 
           <div className="space-y-2">

@@ -26,8 +26,10 @@ import {
 } from "@/lib/statement-import";
 import {
   getStoredVoiceApiKey,
+  getStoredVoiceLanguage,
   maskApiKey,
   setStoredVoiceApiKey,
+  setStoredVoiceLanguage,
 } from "@/lib/voice-settings";
 import type { Category, ExportPayload, Preferences, Wallet } from "@/lib/types";
 
@@ -53,6 +55,7 @@ export default function SettingsPage() {
   const [showStatementPasswordModal, setShowStatementPasswordModal] = useState(false);
   const [voiceApiKeyInput, setVoiceApiKeyInput] = useState("");
   const [savedVoiceApiKeyMask, setSavedVoiceApiKeyMask] = useState("Not configured");
+  const [voiceLanguage, setVoiceLanguage] = useState("en-US");
 
   useEffect(() => {
     Promise.all([getPreferences(), getWallets(), getCategories()])
@@ -62,6 +65,7 @@ export default function SettingsPage() {
         setCategories(categoryRows);
         setStatementWalletId(prefs.defaultWalletId ?? walletRows[0]?.id ?? "");
         setSavedVoiceApiKeyMask(maskApiKey(getStoredVoiceApiKey()));
+        setVoiceLanguage(getStoredVoiceLanguage());
       })
       .catch(() => undefined);
   }, []);
@@ -201,6 +205,26 @@ export default function SettingsPage() {
               Remove Voice Key
             </Button>
           </div>
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              Voice Language
+            </span>
+            <Input
+              value={voiceLanguage}
+              onChange={(event) => setVoiceLanguage(event.target.value)}
+              placeholder="en-US or hi-IN"
+            />
+          </label>
+          <Button
+            variant="secondary"
+            className="w-full"
+            onClick={() => {
+              setStoredVoiceLanguage(voiceLanguage);
+              setStatus(`Voice language saved as ${voiceLanguage || "en-US"}.`);
+            }}
+          >
+            Save Voice Language
+          </Button>
         </Card>
 
         <Card className="space-y-3">
