@@ -205,6 +205,8 @@ export function VoiceAssistant() {
   const router = useRouter();
   const pathname = usePathname();
   const sessionRef = useRef<RealtimeSession | null>(null);
+  const sessionGenerationRef = useRef(0);
+  const openRef = useRef(false);
   const pendingTransactionRef = useRef<PendingTransactionDraft>({});
   const [open, setOpen] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -215,6 +217,10 @@ export function VoiceAssistant() {
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [pendingTransaction, setPendingTransaction] = useState<PendingTransactionDraft>({});
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+
+  useEffect(() => {
+    openRef.current = open;
+  }, [open]);
 
   useEffect(() => {
     pendingTransactionRef.current = pendingTransaction;
@@ -243,25 +249,48 @@ export function VoiceAssistant() {
 
   useEffect(() => {
     return () => {
+      sessionGenerationRef.current += 1;
       sessionRef.current?.close();
       sessionRef.current = null;
     };
   }, []);
 
   async function syncTranscriptFromHistory(history: RealtimeItem[]) {
-    const nextTranscript = history
-      .filter(isCompletedTranscriptMessage)
-      .map((item) => ({
+    const nextTranscript: TranscriptEntry[] = [];
+    for (const item of history.filter(isCompletedTranscriptMessage)) {
+      const entry = {
         id: item.itemId,
         role: item.role === "assistant" ? "assistant" : "user",
-        text: getRealtimeText(item),
-      }))
-      .filter((entry) => entry.text.trim()) as TranscriptEntry[];
+        text: getRealtimeText(item).trim(),
+      };
+      if (!entry.text) continue;
+      const previous = nextTranscript[nextTranscript.length - 1];
+      if (previous && previous.role === entry.role && previous.text === entry.text) {
+        continue;
+      }
+      nextTranscript.push(entry);
+    }
     setTranscript(nextTranscript.slice(-10));
   }
 
+  function teardownRealtimeSession(options?: { clearTranscript?: boolean; clearError?: boolean }) {
+    sessionGenerationRef.current += 1;
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    session?.close();
+    setConnected(false);
+    setProcessing(false);
+    if (options?.clearTranscript ?? true) {
+      setTranscript([]);
+    }
+    if (options?.clearError ?? true) {
+      setError("");
+    }
+  }
+
   const connectRealtime = useCallback(async () => {
-    if (sessionRef.current || !open) return;
+    if (sessionRef.current || !openRef.current) return;
+    const sessionGeneration = ++sessionGenerationRef.current;
     const apiKey = getStoredVoiceApiKey();
     if (!apiKey) {
       setError("Add your OpenAI API key in Settings to use voice assistant.");
@@ -270,9 +299,12 @@ export function VoiceAssistant() {
 
     setProcessing(true);
     setError("");
+    setConnected(false);
 
+    let session: RealtimeSession | null = null;
     try {
       const initialContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
+      if (sessionGeneration !== sessionGenerationRef.current || !openRef.current) return;
 
       const updateDraftTool = tool({
         name: "update_transaction_draft",
@@ -401,7 +433,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         tools: [updateDraftTool, getSnapshotTool, saveDraftTool, navigateTool],
       });
 
-      const session = new RealtimeSession(agent, {
+      session = new RealtimeSession(agent, {
         model: "gpt-realtime",
         transport: "webrtc",
         config: {
@@ -426,10 +458,20 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         },
       });
 
+      sessionRef.current = session;
+
+      const isCurrentSession = () =>
+        sessionRef.current === session &&
+        sessionGenerationRef.current === sessionGeneration &&
+        openRef.current;
+
       session.on("history_updated", (history) => {
+        if (!isCurrentSession()) return;
         void syncTranscriptFromHistory(history);
       });
       session.on("error", (nextError) => {
+        if (!isCurrentSession()) return;
+        teardownRealtimeSession({ clearTranscript: false, clearError: false });
         setError(
           nextError.error instanceof Error
             ? nextError.error.message
@@ -438,24 +480,33 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
       });
 
       const clientSecret = await mintRealtimeClientSecret(apiKey);
+      if (!isCurrentSession()) {
+        session.close();
+        return;
+      }
       await session.connect({ apiKey: clientSecret, model: "gpt-realtime" });
-      sessionRef.current = session;
+      if (!isCurrentSession()) {
+        session.close();
+        return;
+      }
       setConnected(true);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Could not start voice session.");
-      sessionRef.current?.close();
+      if (sessionGeneration === sessionGenerationRef.current) {
+        setError(nextError instanceof Error ? nextError.message : "Could not start voice session.");
+      }
+      session?.close();
       sessionRef.current = null;
       setConnected(false);
     } finally {
-      setProcessing(false);
+      if (sessionGeneration === sessionGenerationRef.current) {
+        setProcessing(false);
+      }
     }
-  }, [open, pathname, router, voiceLanguage]);
+  }, [pathname, router, voiceLanguage]);
 
-  function closeRealtime() {
-    sessionRef.current?.close();
-    sessionRef.current = null;
-    setConnected(false);
-  }
+  const closeRealtime = useCallback(() => {
+    teardownRealtimeSession({ clearTranscript: true, clearError: true });
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -463,7 +514,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
       return;
     }
     closeRealtime();
-  }, [open, connectRealtime]);
+  }, [open, closeRealtime, connectRealtime]);
 
   async function sendTypedMessage() {
     const message = draft.trim();
@@ -507,7 +558,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         <div className="space-y-3">
           <Card className="space-y-3 border-white/10">
             <p className="text-xs text-[var(--muted)]">
-              Realtime voice is {connected ? "connected" : processing ? "connecting..." : "offline"}.
+              Realtime voice is {connected ? "connected" : processing ? "connecting..." : error ? "failed" : "offline"}.
               The mic/audio session starts automatically when this popup opens.
             </p>
             <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2">
@@ -516,7 +567,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
                 disabled={!apiKeyAvailable || processing || connected}
                 onClick={() => void connectRealtime()}
               >
-                {processing ? "Connecting..." : connected ? "Connected" : "Start Realtime Voice"}
+                {processing ? "Connecting..." : connected ? "Connected" : error ? "Retry Voice" : "Start Realtime Voice"}
               </Button>
               <Button
                 variant="secondary"
