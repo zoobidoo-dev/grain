@@ -9,16 +9,6 @@ export default function manifest(): MetadataRoute.Manifest {
     display: "standalone",
     background_color: "#000000",
     theme_color: "#000000",
-    share_target: {
-      action: "/transactions/new",
-      method: "GET",
-      enctype: "application/x-www-form-urlencoded",
-      params: {
-        title: "shareTitle",
-        text: "shareText",
-        url: "shareUrl",
-      },
-    },
     icons: [
       {
         src: "/icon",

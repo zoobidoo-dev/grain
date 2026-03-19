@@ -16,8 +16,10 @@
   "dependencies": {
     "idb": "^8.0.3",
     "next": "16.1.7",
+    "pdfjs-dist": "^5.5.207",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@opennextjs/cloudflare": "^1.17.1",

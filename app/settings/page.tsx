@@ -7,15 +7,20 @@ import { Button } from "@/app/components/ui/Button";
 import { Card } from "@/app/components/ui/Card";
 import { Input } from "@/app/components/ui/Input";
 import { Modal } from "@/app/components/ui/Modal";
+import { Select } from "@/app/components/ui/Select";
 import { ONBOARDING_START_EVENT } from "@/lib/constants";
 import {
+  addTransactions,
   exportData,
+  getCategories,
   getPreferences,
+  getWallets,
   importData,
   resetData,
   updatePreferences,
 } from "@/lib/db";
-import type { ExportPayload, Preferences } from "@/lib/types";
+import { parseStatementFile, type ParsedStatementRow } from "@/lib/statement-import";
+import type { Category, ExportPayload, Preferences, Wallet } from "@/lib/types";
 
 export default function SettingsPage() {
   const [preferences, setPreferences] = useState<Preferences>({
@@ -25,10 +30,47 @@ export default function SettingsPage() {
   });
   const [status, setStatus] = useState("");
   const [showPreferencesModal, setShowPreferencesModal] = useState(false);
+  const [wallets, setWallets] = useState<Wallet[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [statementRows, setStatementRows] = useState<ParsedStatementRow[]>([]);
+  const [statementWarnings, setStatementWarnings] = useState<string[]>([]);
+  const [statementFileName, setStatementFileName] = useState("");
+  const [statementWalletId, setStatementWalletId] = useState("");
+  const [statementCategoryId, setStatementCategoryId] = useState("other");
+  const [statementImporting, setStatementImporting] = useState(false);
 
   useEffect(() => {
-    getPreferences().then(setPreferences).catch(() => undefined);
+    Promise.all([getPreferences(), getWallets(), getCategories()])
+      .then(([prefs, walletRows, categoryRows]) => {
+        setPreferences(prefs);
+        setWallets(walletRows);
+        setCategories(categoryRows);
+        setStatementWalletId(prefs.defaultWalletId ?? walletRows[0]?.id ?? "");
+      })
+      .catch(() => undefined);
   }, []);
+
+  async function handleStatementFile(file: File) {
+    setStatus("");
+    try {
+      const parsed = await parseStatementFile(file);
+      setStatementRows(parsed.rows);
+      setStatementWarnings(parsed.warnings);
+      setStatementFileName(file.name);
+      setStatus(
+        parsed.rows.length
+          ? `Detected ${parsed.rows.length} transactions from ${file.name}. Review and import them below.`
+          : `No transactions detected in ${file.name}.`,
+      );
+    } catch (error) {
+      setStatementRows([]);
+      setStatementWarnings([]);
+      setStatementFileName("");
+      setStatus(
+        error instanceof Error ? error.message : "Statement import failed.",
+      );
+    }
+  }
 
   return (
     <main>
@@ -83,6 +125,127 @@ export default function SettingsPage() {
             }}
           >
             Replay Onboarding
+          </Button>
+        </Card>
+
+        <Card className="space-y-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+            Statement Import
+          </p>
+          <p className="text-sm muted">
+            Upload bank or card statements in PDF, CSV, XLS, or XLSX format to import
+            back-dated transactions into history.
+          </p>
+
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              Statement File
+            </span>
+            <input
+              type="file"
+              accept=".pdf,.csv,.xls,.xlsx,application/pdf,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              onChange={async (event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                await handleStatementFile(file);
+              }}
+              className="w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] p-2 text-sm"
+            />
+          </label>
+
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              Import Into Wallet
+            </span>
+            <Select
+              value={statementWalletId}
+              onChange={setStatementWalletId}
+              options={wallets.map((wallet) => ({
+                value: wallet.id,
+                label: wallet.name,
+              }))}
+              className="text-sm"
+              ariaLabel="Statement wallet"
+            />
+          </label>
+
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              Default Category
+            </span>
+            <Select
+              value={statementCategoryId}
+              onChange={setStatementCategoryId}
+              options={categories
+                .filter((category) => !category.archived)
+                .map((category) => ({
+                  value: category.id,
+                  label: category.name,
+                }))}
+              className="text-sm"
+              ariaLabel="Statement category"
+            />
+          </label>
+
+          {statementFileName ? (
+            <div className="space-y-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] p-3">
+              <p className="text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+                Preview
+              </p>
+              <p className="text-sm muted">
+                {statementFileName} • {statementRows.length} detected rows
+              </p>
+              {statementWarnings.slice(0, 3).map((warning) => (
+                <p key={warning} className="text-xs text-[var(--muted)]">
+                  {warning}
+                </p>
+              ))}
+              <div className="space-y-2">
+                {statementRows.slice(0, 5).map((row, index) => (
+                  <div
+                    key={`${row.createdAt}-${row.amount}-${index}`}
+                    className="rounded-[var(--radius-sm)] border border-[var(--border)] p-2"
+                  >
+                    <p className="text-sm matrix-label">{row.description}</p>
+                    <p className="text-xs muted">
+                      {row.createdAt.slice(0, 10)} • {row.type} • {row.amount}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <Button
+            className="w-full"
+            disabled={!statementRows.length || !statementWalletId || statementImporting}
+            onClick={async () => {
+              setStatementImporting(true);
+              try {
+                await addTransactions(
+                  statementRows.map((row) => ({
+                    amount: row.amount,
+                    type: row.type,
+                    categoryId: statementCategoryId,
+                    walletId: statementWalletId,
+                    createdAt: row.createdAt,
+                    note: row.description,
+                  })),
+                );
+                setStatus(
+                  `${statementRows.length} transactions imported from ${statementFileName}. View them in History.`,
+                );
+                setStatementRows([]);
+                setStatementWarnings([]);
+                setStatementFileName("");
+              } catch {
+                setStatus("Statement import failed while saving transactions.");
+              } finally {
+                setStatementImporting(false);
+              }
+            }}
+          >
+            {statementImporting ? "Importing..." : "Import Statement Transactions"}
           </Button>
         </Card>
 

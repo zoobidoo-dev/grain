@@ -265,6 +265,44 @@ export async function addTransaction(input: NewTransaction) {
   return row;
 }
 
+export async function addTransactions(
+  inputs: Array<
+    Pick<
+      NewTransaction,
+      "amount" | "type" | "categoryId" | "walletId" | "createdAt" | "note"
+    >
+  >,
+) {
+  if (!inputs.length) return [];
+
+  const db = await getDb();
+  const prefs = await getPreferences();
+  const fallbackWalletId =
+    prefs.defaultWalletId ?? DEFAULT_WALLETS[0].id;
+  const tx = db.transaction("transactions", "readwrite");
+  const store = tx.objectStore("transactions");
+  const rows: Transaction[] = [];
+
+  for (const input of inputs) {
+    const isoDate = input.createdAt ?? new Date().toISOString();
+    const row: Transaction = {
+      id: generateId(),
+      amount: input.amount,
+      type: input.type,
+      categoryId: input.categoryId,
+      walletId: input.walletId ?? fallbackWalletId,
+      note: input.note?.trim(),
+      createdAt: isoDate,
+      updatedAt: isoDate,
+    };
+    await store.put(row);
+    rows.push(row);
+  }
+
+  await tx.done;
+  return rows;
+}
+
 export async function updateTransaction(
   id: string,
   input: Partial<Omit<Transaction, "id" | "updatedAt">>,
