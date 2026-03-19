@@ -19,7 +19,11 @@ import {
   resetData,
   updatePreferences,
 } from "@/lib/db";
-import { parseStatementFile, type ParsedStatementRow } from "@/lib/statement-import";
+import {
+  parseStatementFile,
+  StatementPasswordError,
+  type ParsedStatementRow,
+} from "@/lib/statement-import";
 import type { Category, ExportPayload, Preferences, Wallet } from "@/lib/types";
 
 export default function SettingsPage() {
@@ -38,6 +42,10 @@ export default function SettingsPage() {
   const [statementWalletId, setStatementWalletId] = useState("");
   const [statementCategoryId, setStatementCategoryId] = useState("other");
   const [statementImporting, setStatementImporting] = useState(false);
+  const [pendingStatementFile, setPendingStatementFile] = useState<File | null>(null);
+  const [statementPassword, setStatementPassword] = useState("");
+  const [statementPasswordError, setStatementPasswordError] = useState("");
+  const [showStatementPasswordModal, setShowStatementPasswordModal] = useState(false);
 
   useEffect(() => {
     Promise.all([getPreferences(), getWallets(), getCategories()])
@@ -50,19 +58,32 @@ export default function SettingsPage() {
       .catch(() => undefined);
   }, []);
 
-  async function handleStatementFile(file: File) {
+  async function handleStatementFile(file: File, password?: string) {
     setStatus("");
     try {
-      const parsed = await parseStatementFile(file);
+      const parsed = await parseStatementFile(file, password);
       setStatementRows(parsed.rows);
       setStatementWarnings(parsed.warnings);
       setStatementFileName(file.name);
+      setPendingStatementFile(null);
+      setStatementPassword("");
+      setStatementPasswordError("");
+      setShowStatementPasswordModal(false);
       setStatus(
         parsed.rows.length
           ? `Detected ${parsed.rows.length} transactions from ${file.name}. Review and import them below.`
           : `No transactions detected in ${file.name}.`,
       );
     } catch (error) {
+      if (error instanceof StatementPasswordError) {
+        setPendingStatementFile(file);
+        setStatementFileName(file.name);
+        setStatementRows([]);
+        setStatementWarnings([]);
+        setStatementPasswordError(error.message);
+        setShowStatementPasswordModal(true);
+        return;
+      }
       setStatementRows([]);
       setStatementWarnings([]);
       setStatementFileName("");
@@ -377,6 +398,53 @@ export default function SettingsPage() {
             }}
           >
             Save Preferences
+          </Button>
+        </div>
+      </Modal>
+
+      <Modal
+        open={showStatementPasswordModal}
+        onClose={() => {
+          setShowStatementPasswordModal(false);
+          setPendingStatementFile(null);
+          setStatementPassword("");
+          setStatementPasswordError("");
+        }}
+        title="Statement Password"
+        subtitle={statementFileName || "Protected file"}
+      >
+        <div className="space-y-3">
+          <p className="text-sm muted">
+            This statement is password protected. Enter the file password to continue.
+          </p>
+
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              Password
+            </span>
+            <Input
+              type="password"
+              value={statementPassword}
+              onChange={(event) => {
+                setStatementPassword(event.target.value);
+                setStatementPasswordError("");
+              }}
+              placeholder="Enter statement password"
+            />
+          </label>
+
+          {statementPasswordError ? (
+            <p className="text-sm text-[var(--danger)]">{statementPasswordError}</p>
+          ) : null}
+
+          <Button
+            className="w-full"
+            onClick={async () => {
+              if (!pendingStatementFile) return;
+              await handleStatementFile(pendingStatementFile, statementPassword);
+            }}
+          >
+            Unlock Statement
           </Button>
         </div>
       </Modal>

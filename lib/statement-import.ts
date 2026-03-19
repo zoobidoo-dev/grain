@@ -14,6 +14,13 @@ export type ParsedStatementFile = {
   warnings: string[];
 };
 
+export class StatementPasswordError extends Error {
+  constructor(message = "This statement is password protected.") {
+    super(message);
+    this.name = "StatementPasswordError";
+  }
+}
+
 const DATE_HEADER_PATTERNS = [
   "date",
   "txn date",
@@ -240,7 +247,16 @@ function parsePdfLine(line: string, source: string): ParsedStatementRow | null {
   };
 }
 
-async function parsePdf(file: File): Promise<ParsedStatementFile> {
+function isPasswordError(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  return (
+    message.includes("password") ||
+    message.includes("encrypted") ||
+    message.includes("protection")
+  );
+}
+
+async function loadPdf(file: File, password?: string) {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = new URL(
     "pdfjs-dist/legacy/build/pdf.worker.mjs",
@@ -248,7 +264,20 @@ async function parsePdf(file: File): Promise<ParsedStatementFile> {
   ).toString();
 
   const buffer = await file.arrayBuffer();
-  const pdf = await pdfjs.getDocument({ data: buffer }).promise;
+  try {
+    return await pdfjs.getDocument({ data: buffer, password }).promise;
+  } catch (error) {
+    if (isPasswordError(error)) {
+      throw new StatementPasswordError(
+        password ? "Incorrect statement password." : "Statement password required.",
+      );
+    }
+    throw error;
+  }
+}
+
+async function parsePdf(file: File, password?: string): Promise<ParsedStatementFile> {
+  const pdf = await loadPdf(file, password);
   const rows: ParsedStatementRow[] = [];
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -280,13 +309,27 @@ async function parsePdf(file: File): Promise<ParsedStatementFile> {
   };
 }
 
-async function parseSpreadsheet(file: File): Promise<ParsedStatementFile> {
+async function parseSpreadsheet(
+  file: File,
+  password?: string,
+): Promise<ParsedStatementFile> {
   const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, {
-    type: "array",
-    cellDates: true,
-    raw: true,
-  });
+  let workbook: XLSX.WorkBook;
+  try {
+    workbook = XLSX.read(buffer, {
+      type: "array",
+      cellDates: true,
+      raw: true,
+      password,
+    });
+  } catch (error) {
+    if (isPasswordError(error)) {
+      throw new StatementPasswordError(
+        password ? "Incorrect statement password." : "Statement password required.",
+      );
+    }
+    throw error;
+  }
 
   const allRows = workbook.SheetNames.flatMap((sheetName) => {
     const sheet = workbook.Sheets[sheetName];
@@ -302,10 +345,13 @@ async function parseSpreadsheet(file: File): Promise<ParsedStatementFile> {
   return mapSheetRows(allRows, file.name);
 }
 
-export async function parseStatementFile(file: File): Promise<ParsedStatementFile> {
+export async function parseStatementFile(
+  file: File,
+  password?: string,
+): Promise<ParsedStatementFile> {
   const lowercaseName = file.name.toLowerCase();
   if (lowercaseName.endsWith(".pdf")) {
-    return parsePdf(file);
+    return parsePdf(file, password);
   }
 
   if (
@@ -313,7 +359,7 @@ export async function parseStatementFile(file: File): Promise<ParsedStatementFil
     lowercaseName.endsWith(".xls") ||
     lowercaseName.endsWith(".xlsx")
   ) {
-    return parseSpreadsheet(file);
+    return parseSpreadsheet(file, password);
   }
 
   throw new Error("Unsupported file type. Use PDF, CSV, XLS, or XLSX.");
