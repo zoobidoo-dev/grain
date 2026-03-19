@@ -1,7 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import { z } from "zod";
+import {
+  RealtimeAgent,
+  RealtimeSession,
+  tool,
+  utils,
+  type RealtimeItem,
+} from "@openai/agents/realtime";
 import { Button } from "@/app/components/ui/Button";
 import { Card } from "@/app/components/ui/Card";
 import { Modal } from "@/app/components/ui/Modal";
@@ -21,22 +29,6 @@ import {
 } from "@/lib/voice-settings";
 import type { TransactionType } from "@/lib/types";
 
-type VoiceAgentResponse = {
-  reply: string;
-  updates?: {
-    amount?: number;
-    type?: TransactionType;
-    categoryId?: string;
-    walletId?: string;
-    createdAt?: string;
-    note?: string;
-  };
-  requiresConfirmation?: boolean;
-  shouldSave?: boolean;
-  clearDraft?: boolean;
-  navigatePath?: string;
-};
-
 type PendingTransactionDraft = {
   amount?: number;
   type?: TransactionType;
@@ -47,42 +39,50 @@ type PendingTransactionDraft = {
   awaitingConfirmation?: boolean;
 };
 
-type AssistantContext = Awaited<ReturnType<typeof buildAssistantContext>>;
-
 type TranscriptEntry = {
   id: string;
   role: "user" | "assistant";
   text: string;
 };
 
-type SpeechRecognitionResultLike = {
-  readonly 0: { readonly transcript: string };
-};
+type AssistantContext = Awaited<ReturnType<typeof buildAssistantContext>>;
 
-type SpeechRecognitionEventLike = Event & {
-  readonly results: ArrayLike<SpeechRecognitionResultLike>;
-};
+function getRealtimeText(item: RealtimeItem) {
+  if (item.type !== "message") return "";
+  if (item.role === "assistant") {
+    return (
+      utils.getLastTextFromAudioOutputMessage(item) ??
+      item.content
+        .map((content) => {
+          if ("text" in content) return content.text ?? "";
+          if ("transcript" in content) return content.transcript ?? "";
+          return "";
+        })
+        .join(" ")
+        .trim()
+    );
+  }
 
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: Event & { error?: string }) => void) | null;
-  onend: (() => void) | null;
-};
+  return item.content
+    .map((content) => {
+      if ("text" in content) return content.text ?? "";
+      if ("transcript" in content) return content.transcript ?? "";
+      return "";
+    })
+    .join(" ")
+    .trim();
+}
 
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-function getSpeechRecognitionConstructor() {
-  if (typeof window === "undefined") return null;
-  const browserWindow = window as Window & {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  };
-  return browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition ?? null;
+function isCompletedTranscriptMessage(item: RealtimeItem): item is Extract<
+  RealtimeItem,
+  { type: "message"; role: "user" | "assistant" }
+> {
+  return (
+    item.type === "message" &&
+    item.role !== "system" &&
+    "status" in item &&
+    item.status === "completed"
+  );
 }
 
 async function buildAssistantContext(pathname: string, pendingTransaction: PendingTransactionDraft) {
@@ -128,45 +128,6 @@ async function buildAssistantContext(pathname: string, pendingTransaction: Pendi
   };
 }
 
-function yesIntent(text: string) {
-  return /^(yes|yeah|yep|haan|han|ha|ok|okay|save|confirm|kar do|haan save|yes save)\b/i.test(
-    text.trim(),
-  );
-}
-
-function noIntent(text: string) {
-  return /^(no|nah|cancel|stop|mat karo|don't save|dont save)\b/i.test(text.trim());
-}
-
-function missingDraftFields(
-  draft: PendingTransactionDraft,
-  context: AssistantContext,
-) {
-  const missing: string[] = [];
-  if (!draft.amount) missing.push("amount");
-  if (!draft.type) missing.push("type");
-  if (!draft.categoryId) missing.push("category");
-  if (!draft.walletId) missing.push("wallet");
-  if (!draft.createdAt) missing.push("date");
-
-  if (missing.length === 0) return [];
-
-  return missing.map((field) => {
-    if (field === "wallet") {
-      const walletNames = context.wallets.slice(0, 5).map((wallet) => wallet.name).join(", ");
-      return `wallet (${walletNames})`;
-    }
-    if (field === "category") {
-      const categoryNames = context.categories
-        .slice(0, 5)
-        .map((category) => category.name)
-        .join(", ");
-      return `category (${categoryNames})`;
-    }
-    return field;
-  });
-}
-
 function formatDraftSummary(draft: PendingTransactionDraft, context: AssistantContext) {
   const categoryName =
     context.categories.find((category) => category.id === draft.categoryId)?.name ?? "Unknown";
@@ -191,22 +152,73 @@ function validateDraft(
   return true;
 }
 
+function missingDraftFields(
+  draft: PendingTransactionDraft,
+  context: AssistantContext,
+) {
+  const missing: string[] = [];
+  if (!draft.amount) missing.push("amount");
+  if (!draft.type) missing.push("type");
+  if (!draft.categoryId) missing.push("category");
+  if (!draft.walletId) missing.push("wallet");
+  if (!draft.createdAt) missing.push("date");
+
+  if (missing.length === 0) return [];
+
+  return missing.map((field) => {
+    if (field === "wallet") {
+      return `wallet (${context.wallets.slice(0, 5).map((wallet) => wallet.name).join(", ")})`;
+    }
+    if (field === "category") {
+      return `category (${context.categories
+        .slice(0, 5)
+        .map((category) => category.name)
+        .join(", ")})`;
+    }
+    return field;
+  });
+}
+
+async function mintRealtimeClientSecret(apiKey: string) {
+  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      session: {
+        type: "realtime",
+        model: "gpt-realtime",
+      },
+    }),
+  });
+
+  const payload = (await response.json()) as { value?: string; error?: { message?: string } };
+  if (!response.ok || !payload.value) {
+    throw new Error(payload.error?.message ?? "Could not create Realtime client secret.");
+  }
+  return payload.value;
+}
+
 export function VoiceAssistant() {
   const router = useRouter();
   const pathname = usePathname();
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const sessionRef = useRef<RealtimeSession | null>(null);
+  const pendingTransactionRef = useRef<PendingTransactionDraft>({});
   const [open, setOpen] = useState(false);
-  const [listening, setListening] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
+  const [connected, setConnected] = useState(false);
   const [apiKeyAvailable, setApiKeyAvailable] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [pendingTransaction, setPendingTransaction] = useState<PendingTransactionDraft>({});
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const recognitionSupported = Boolean(getSpeechRecognitionConstructor());
-  const speechSupported =
-    typeof window !== "undefined" && "speechSynthesis" in window;
+
+  useEffect(() => {
+    pendingTransactionRef.current = pendingTransaction;
+  }, [pendingTransaction]);
 
   useEffect(() => {
     function refreshApiKeyState() {
@@ -231,230 +243,226 @@ export function VoiceAssistant() {
 
   useEffect(() => {
     return () => {
-      recognitionRef.current?.stop();
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
+      sessionRef.current?.close();
+      sessionRef.current = null;
     };
   }, []);
 
-  function speak(text: string) {
-    if (!speechSupported || !text.trim()) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    window.speechSynthesis.speak(utterance);
+  async function syncTranscriptFromHistory(history: RealtimeItem[]) {
+    const nextTranscript = history
+      .filter(isCompletedTranscriptMessage)
+      .map((item) => ({
+        id: item.itemId,
+        role: item.role === "assistant" ? "assistant" : "user",
+        text: getRealtimeText(item),
+      }))
+      .filter((entry) => entry.text.trim()) as TranscriptEntry[];
+    setTranscript(nextTranscript.slice(-10));
   }
 
-  function mergeDraft(
-    current: PendingTransactionDraft,
-    updates: VoiceAgentResponse["updates"],
-  ): PendingTransactionDraft {
-    if (!updates) return current;
-    return {
-      ...current,
-      ...Object.fromEntries(
-        Object.entries(updates).filter(([, value]) => value !== undefined),
-      ),
-    };
-  }
-
-  async function sendToAgent(text: string) {
-    const utterance = text.trim();
-    if (!utterance) return;
+  const connectRealtime = useCallback(async () => {
+    if (sessionRef.current || !open) return;
     const apiKey = getStoredVoiceApiKey();
     if (!apiKey) {
       setError("Add your OpenAI API key in Settings to use voice assistant.");
       return;
     }
 
-    setError("");
     setProcessing(true);
-    setTranscript((current) => [
-      ...current,
-      { id: crypto.randomUUID(), role: "user", text: utterance },
-    ]);
+    setError("");
 
     try {
-      const context = await buildAssistantContext(pathname, pendingTransaction);
+      const initialContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
 
-      if (pendingTransaction.awaitingConfirmation) {
-        if (yesIntent(utterance)) {
-          if (!validateDraft(pendingTransaction, context)) {
-            throw new Error("Draft is incomplete. Complete the missing fields first.");
+      const updateDraftTool = tool({
+        name: "update_transaction_draft",
+        description:
+          "Update any known transaction draft fields from the user's latest speech. Use this whenever the user provides or corrects amount, type, category, wallet, date, or note.",
+        parameters: z.object({
+          amount: z.number().positive().optional(),
+          type: z.enum(["income", "expense"]).optional(),
+          categoryId: z.string().optional(),
+          walletId: z.string().optional(),
+          createdAt: z.string().optional(),
+          note: z.string().optional(),
+          awaitingConfirmation: z.boolean().optional(),
+          clearDraft: z.boolean().optional(),
+        }),
+        execute: async (input) => {
+          if (input.clearDraft) {
+            setPendingTransaction({});
+            pendingTransactionRef.current = {};
+            return "Transaction draft cleared.";
+          }
+
+          const nextDraft: PendingTransactionDraft = {
+            ...pendingTransactionRef.current,
+            ...Object.fromEntries(
+              Object.entries(input).filter(([, value]) => value !== undefined),
+            ),
+          };
+          delete (nextDraft as { clearDraft?: boolean }).clearDraft;
+          setPendingTransaction(nextDraft);
+          pendingTransactionRef.current = nextDraft;
+          const liveContext = await buildAssistantContext(pathname, nextDraft);
+          const missing = missingDraftFields(nextDraft, liveContext);
+          return missing.length
+            ? `Draft updated. Missing ${missing.join(", ")}.`
+            : `Draft updated: ${formatDraftSummary(nextDraft, liveContext)}.`;
+        },
+      });
+
+      const getSnapshotTool = tool({
+        name: "get_finance_snapshot",
+        description:
+          "Get current finance context, including categories, wallets, pending transaction draft, and current month summary before asking follow-up questions.",
+        parameters: z.object({}),
+        execute: async () => {
+          const context = await buildAssistantContext(pathname, pendingTransactionRef.current);
+          return JSON.stringify(context);
+        },
+      });
+
+      const saveDraftTool = tool({
+        name: "save_transaction_draft",
+        description:
+          "Save the current transaction draft only after the user explicitly confirms with yes, sure, okay, go ahead, save it, haan, or similar.",
+        parameters: z.object({}),
+        execute: async () => {
+          const liveContext = await buildAssistantContext(pathname, pendingTransactionRef.current);
+          const currentDraft = pendingTransactionRef.current;
+          if (!validateDraft(currentDraft, liveContext)) {
+            return `Cannot save yet. Missing ${missingDraftFields(currentDraft, liveContext).join(", ")}.`;
           }
           await addTransaction({
-            amount: pendingTransaction.amount!,
-            type: pendingTransaction.type!,
-            categoryId: pendingTransaction.categoryId!,
-            walletId: pendingTransaction.walletId!,
-            createdAt: pendingTransaction.createdAt,
-            note: pendingTransaction.note,
+            amount: currentDraft.amount!,
+            type: currentDraft.type!,
+            categoryId: currentDraft.categoryId!,
+            walletId: currentDraft.walletId!,
+            createdAt: currentDraft.createdAt,
+            note: currentDraft.note,
           });
-          const reply = `Saved ${formatDraftSummary(pendingTransaction, context)}.`;
+          const summary = formatDraftSummary(currentDraft, liveContext);
           setPendingTransaction({});
-          setTranscript((current) => [
-            ...current,
-            { id: crypto.randomUUID(), role: "assistant", text: reply },
-          ]);
-          speak(reply);
-          setDraft("");
+          pendingTransactionRef.current = {};
           router.push("/transactions");
-          return;
-        }
-
-        if (noIntent(utterance)) {
-          const reply = "Okay, I did not save it. You can continue editing the draft.";
-          setPendingTransaction((current) => ({
-            ...current,
-            awaitingConfirmation: false,
-          }));
-          setTranscript((current) => [
-            ...current,
-            { id: crypto.randomUUID(), role: "assistant", text: reply },
-          ]);
-          speak(reply);
-          return;
-        }
-      }
-
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
+          return `Saved ${summary}.`;
         },
-        body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          response_format: { type: "json_object" },
-          temperature: 0.2,
-          messages: [
-            {
-              role: "system",
-              content:
-                'You are Grain Voice, a finance voice assistant inside a personal finance tracker. Understand broken English, pauses, partial sentences, and user corrections. Maintain and fill a transaction draft instead of starting over each turn. Reply in the same language as the user when possible. Return ONLY valid JSON with this shape: {"reply": string, "updates"?: {"amount"?: number, "type"?: "income"|"expense", "categoryId"?: string, "walletId"?: string, "createdAt"?: string, "note"?: string}, "requiresConfirmation"?: boolean, "shouldSave"?: boolean, "clearDraft"?: boolean, "navigatePath"?: string}. Use the provided category and wallet ids exactly. Ask only for missing fields. If the user corrects a previous field, overwrite it in updates. Save only after explicit confirmation or a very clear save intent.',
-            },
-            {
-              role: "user",
-              content: JSON.stringify({
-                utterance,
-                language: voiceLanguage,
-                context,
-                recentTranscript: transcript.slice(-6),
-              }),
-            },
-          ],
-        }),
       });
-      const rawPayload = (await response.json()) as
-        | VoiceAgentResponse
-        | { error?: { message?: string } }
-        | { choices?: Array<{ message?: { content?: string } }> };
-      if (!response.ok) {
-        const message =
-          "error" in rawPayload && rawPayload.error?.message
-            ? rawPayload.error.message
-            : "Voice agent request failed.";
-        throw new Error(message);
-      }
 
-      const payload =
-        "choices" in rawPayload
-          ? (JSON.parse(rawPayload.choices?.[0]?.message?.content ?? "{}") as VoiceAgentResponse)
-          : (rawPayload as VoiceAgentResponse);
+      const navigateTool = tool({
+        name: "navigate_app",
+        description:
+          "Navigate the app to a supported route after answering a history or insights request.",
+        parameters: z.object({
+          path: z.enum(["/", "/transactions", "/insights", "/budgets", "/settings"]),
+        }),
+        execute: async ({ path }) => {
+          router.push(path);
+          return `Navigated to ${path}.`;
+        },
+      });
 
-      const nextDraft = mergeDraft(pendingTransaction, payload.updates);
-      const draftWithFlags = {
-        ...nextDraft,
-        awaitingConfirmation: payload.requiresConfirmation && validateDraft(nextDraft, context),
-      };
+      const agent = new RealtimeAgent({
+        name: "Grain Voice",
+        voice: "alloy",
+        instructions: `You are Grain Voice, a production-quality finance voice assistant for a personal finance tracker.
 
-      if (payload.clearDraft) {
-        setPendingTransaction({});
-      } else {
-        setPendingTransaction(draftWithFlags);
-      }
+You must handle:
+- broken English
+- pauses and fragmented speech
+- mixed-language speech when possible
+- follow-up answers without forgetting earlier draft values
+- corrections like "not food, transport" or "not 200, 250"
 
-      if (payload.shouldSave && validateDraft(nextDraft, context)) {
-        await addTransaction({
-          amount: nextDraft.amount!,
-          type: nextDraft.type!,
-          categoryId: nextDraft.categoryId!,
-          walletId: nextDraft.walletId!,
-          createdAt: nextDraft.createdAt,
-          note: nextDraft.note,
-        });
-        setPendingTransaction({});
-      } else if (!payload.shouldSave && !payload.clearDraft) {
-        const missing = missingDraftFields(draftWithFlags, context);
-        if (missing.length && payload.reply.trim().length < 6) {
-          payload.reply = `I have some details. Tell me the missing ${missing.join(", ")}.`;
-        } else if (
-          validateDraft(draftWithFlags, context) &&
-          !draftWithFlags.awaitingConfirmation &&
-          !payload.navigatePath
-        ) {
-          draftWithFlags.awaitingConfirmation = true;
-          setPendingTransaction(draftWithFlags);
-          payload.reply = `I understood ${formatDraftSummary(draftWithFlags, context)}. Say yes to save or tell me what to change.`;
-        }
-      }
+Important rules:
+- Always use tools when updating or saving the transaction draft.
+- Call get_finance_snapshot whenever you need current context or draft state.
+- Do not ask again for fields that are already present in the draft.
+- Ask only for the missing fields.
+- Save only after clear confirmation like yes, sure, okay, save it, go ahead, haan.
+- If the user asks about history or insights, answer briefly and navigate when useful.
+- Reply in the same language as the user when possible.
 
-      if (payload.navigatePath) {
-        router.push(payload.navigatePath);
-      } else if (payload.shouldSave && validateDraft(nextDraft, context)) {
-        router.push("/transactions");
-      }
+Available categories: ${initialContext.categories
+          .map((category) => `${category.name} (${category.id})`)
+          .join(", ")}
+Available wallets: ${initialContext.wallets
+          .map((wallet) => `${wallet.name} (${wallet.id})`)
+          .join(", ")}
+Current month summary: income ${initialContext.monthlySummary.income}, expenses ${initialContext.monthlySummary.expenses}, net ${initialContext.monthlySummary.net}.`,
+        tools: [updateDraftTool, getSnapshotTool, saveDraftTool, navigateTool],
+      });
 
-      setTranscript((current) => [
-        ...current,
-        { id: crypto.randomUUID(), role: "assistant", text: payload.reply },
-      ]);
-      speak(payload.reply);
-      setDraft("");
+      const session = new RealtimeSession(agent, {
+        model: "gpt-realtime",
+        transport: "webrtc",
+        config: {
+          audio: {
+            input: {
+              transcription: {
+                language: voiceLanguage,
+                model: "gpt-4o-mini-transcribe",
+              },
+              turnDetection: {
+                type: "server_vad",
+                createResponse: true,
+                interruptResponse: true,
+                silenceDurationMs: 250,
+              },
+            },
+            output: {
+              voice: "alloy",
+              speed: 1,
+            },
+          },
+        },
+      });
+
+      session.on("history_updated", (history) => {
+        void syncTranscriptFromHistory(history);
+      });
+      session.on("error", (nextError) => {
+        setError(
+          nextError.error instanceof Error
+            ? nextError.error.message
+            : "Realtime voice session failed.",
+        );
+      });
+
+      const clientSecret = await mintRealtimeClientSecret(apiKey);
+      await session.connect({ apiKey: clientSecret, model: "gpt-realtime" });
+      sessionRef.current = session;
+      setConnected(true);
     } catch (nextError) {
-      const message =
-        nextError instanceof Error ? nextError.message : "Voice request failed.";
-      setError(message);
-      setTranscript((current) => [
-        ...current,
-        { id: crypto.randomUUID(), role: "assistant", text: message },
-      ]);
+      setError(nextError instanceof Error ? nextError.message : "Could not start voice session.");
+      sessionRef.current?.close();
+      sessionRef.current = null;
+      setConnected(false);
     } finally {
       setProcessing(false);
     }
+  }, [open, pathname, router, voiceLanguage]);
+
+  function closeRealtime() {
+    sessionRef.current?.close();
+    sessionRef.current = null;
+    setConnected(false);
   }
 
-  function startListening() {
-    const RecognitionConstructor = getSpeechRecognitionConstructor();
-    if (!RecognitionConstructor) {
-      setError("Speech recognition is not available in this browser.");
+  useEffect(() => {
+    if (open) {
+      void connectRealtime();
       return;
     }
+    closeRealtime();
+  }, [open, connectRealtime]);
 
-    recognitionRef.current?.stop();
-    const recognition = new RecognitionConstructor();
-    recognition.lang = voiceLanguage || "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const combined = Array.from(event.results)
-        .map((result) => result[0]?.transcript ?? "")
-        .join(" ")
-        .trim();
-      setDraft(combined);
-      if (combined) {
-        void sendToAgent(combined);
-      }
-    };
-    recognition.onerror = (event) => {
-      setError(event.error ? `Voice input failed: ${event.error}` : "Voice input failed.");
-      setListening(false);
-    };
-    recognition.onend = () => setListening(false);
-    recognitionRef.current = recognition;
-    setListening(true);
-    setError("");
-    recognition.start();
+  async function sendTypedMessage() {
+    const message = draft.trim();
+    if (!message || !sessionRef.current) return;
+    sessionRef.current.sendMessage(message);
+    setDraft("");
   }
 
   return (
@@ -487,47 +495,48 @@ export function VoiceAssistant() {
         open={open}
         onClose={() => setOpen(false)}
         title="Voice Assistant"
-        subtitle="Speak transactions, history, and insights"
+        subtitle="Realtime speech for transactions, history, and insights"
       >
         <div className="space-y-3">
           <Card className="space-y-3 border-white/10">
             <p className="text-xs text-[var(--muted)]">
-              Try: “Add expense 250 for food from Main wallet”, “Show March transactions”,
-              or “Tell me this month spending”.
+              Realtime voice is {connected ? "connected" : processing ? "connecting..." : "offline"}.
+              The mic/audio session starts automatically when this popup opens.
             </p>
             <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2">
               <Button
                 className="w-full"
-                disabled={
-                  listening || processing || !recognitionSupported || !apiKeyAvailable
-                }
-                onClick={startListening}
+                disabled={!apiKeyAvailable || processing || connected}
+                onClick={() => void connectRealtime()}
               >
-                {listening ? "Listening..." : "Start Voice Input"}
+                {processing ? "Connecting..." : connected ? "Connected" : "Start Realtime Voice"}
               </Button>
               <Button
                 variant="secondary"
                 className="w-full"
-                disabled={processing || !draft.trim()}
-                onClick={() => void sendToAgent(draft)}
+                disabled={!connected}
+                onClick={closeRealtime}
               >
-                {processing ? "Thinking..." : "Send Typed Request"}
+                Stop Voice
               </Button>
             </div>
             <textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
-              placeholder="Type or speak a request"
+              placeholder="Typed fallback while the Realtime session is open"
               className="min-h-24 w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted)] focus:border-[rgba(255,255,255,0.55)]"
             />
-            {!recognitionSupported ? (
-              <p className="text-xs text-[var(--muted)]">
-                This browser does not support live microphone recognition. Typed fallback is available.
-              </p>
-            ) : null}
+            <Button
+              variant="secondary"
+              className="w-full"
+              disabled={!connected || !draft.trim()}
+              onClick={() => void sendTypedMessage()}
+            >
+              Send Typed Message
+            </Button>
             {!apiKeyAvailable ? (
               <p className="text-xs text-[var(--muted)]">
-                Add your own OpenAI API key in Settings to enable voice assistant on this browser.
+                Add your own OpenAI API key in Settings to enable Realtime voice on this browser.
               </p>
             ) : null}
             {error ? <p className="text-sm text-[var(--danger)]">{error}</p> : null}
@@ -549,7 +558,10 @@ export function VoiceAssistant() {
             <Button
               variant="secondary"
               className="w-full"
-              onClick={() => setPendingTransaction({})}
+              onClick={() => {
+                setPendingTransaction({});
+                pendingTransactionRef.current = {};
+              }}
             >
               Clear Draft
             </Button>
@@ -559,7 +571,7 @@ export function VoiceAssistant() {
             {transcript.length === 0 ? (
               <p className="text-sm muted">No conversation yet.</p>
             ) : (
-              transcript.slice(-8).map((entry) => (
+              transcript.map((entry) => (
                 <Card key={entry.id} className="space-y-1">
                   <p className="text-xs text-[var(--muted)]">
                     {entry.role === "user" ? "You" : "Assistant"}
