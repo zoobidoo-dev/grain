@@ -277,10 +277,6 @@ export function parseSmartQuery(input: string): SmartQuery {
         continue;
       }
     }
-    if (token.length === 4 && /^\d{4}$/.test(token)) {
-      parsed.year = Number(token);
-      continue;
-    }
     const month = parseMonthToken(token);
     if (month !== undefined) {
       parsed.month = month;
