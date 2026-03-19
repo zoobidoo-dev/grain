@@ -211,6 +211,23 @@ select {
   text-transform: uppercase;
 }
 
+.voice-agent-trigger {
+  position: fixed;
+  right: max(12px, calc(50vw - 228px));
+  bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+  z-index: 45;
+  width: 52px;
+  height: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  background: var(--surface-glass);
+  color: var(--foreground);
+  backdrop-filter: blur(8px);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
 @media (max-width: 420px) {
   .app-shell {
     padding:
@@ -243,6 +260,13 @@ select {
     padding: 6px 2px;
     font-size: 0.62rem;
     letter-spacing: 0.05em;
+  }
+
+  .voice-agent-trigger {
+    right: 10px;
+    bottom: calc(86px + env(safe-area-inset-bottom, 0px));
+    width: 48px;
+    height: 48px;
   }
 }
 
