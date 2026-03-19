@@ -25,6 +25,7 @@ import { formatRealtimeVoiceError } from "@/lib/voice-errors";
 import {
   getStoredVoiceApiKey,
   getStoredVoiceLanguage,
+  normalizeVoiceTranscriptionLanguage,
   VOICE_LANGUAGE_EVENT,
   VOICE_API_KEY_EVENT,
 } from "@/lib/voice-settings";
@@ -457,7 +458,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
             audio: {
               input: {
                 transcription: {
-                  language: voiceLanguage,
+                  language: normalizeVoiceTranscriptionLanguage(voiceLanguage),
                   model: "gpt-4o-mini-transcribe",
                 },
                 turnDetection: {

@@ -29,6 +29,12 @@ export function getStoredVoiceLanguage() {
   return window.localStorage.getItem(VOICE_LANGUAGE_STORAGE_KEY) ?? "en-US";
 }
 
+export function normalizeVoiceTranscriptionLanguage(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/_/g, "-");
+  if (!normalized) return "en";
+  return normalized.split("-")[0] || "en";
+}
+
 export function setStoredVoiceLanguage(value: string) {
   if (typeof window === "undefined") return;
   const nextValue = value.trim() || "en-US";
