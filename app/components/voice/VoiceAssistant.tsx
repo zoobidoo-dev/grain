@@ -269,7 +269,7 @@ export function VoiceAssistant() {
   async function syncTranscriptFromHistory(history: RealtimeItem[]) {
     const nextTranscript: TranscriptEntry[] = [];
     for (const item of history.filter(isCompletedTranscriptMessage)) {
-      const entry = {
+      const entry: TranscriptEntry = {
         id: item.itemId,
         role: item.role === "assistant" ? "assistant" : "user",
         text: getRealtimeText(item).trim(),
