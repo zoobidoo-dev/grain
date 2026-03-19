@@ -13,6 +13,10 @@ import {
   getWallets,
 } from "@/lib/db";
 import { monthKey, summarizeTransactions } from "@/lib/finance";
+import {
+  getStoredVoiceApiKey,
+  VOICE_API_KEY_EVENT,
+} from "@/lib/voice-settings";
 import type { TransactionType } from "@/lib/types";
 
 type VoiceAgentResponse = {
@@ -76,10 +80,25 @@ export function VoiceAssistant() {
   const [processing, setProcessing] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
+  const [apiKeyAvailable, setApiKeyAvailable] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionSupported = Boolean(getSpeechRecognitionConstructor());
   const speechSupported =
     typeof window !== "undefined" && "speechSynthesis" in window;
+
+  useEffect(() => {
+    function refreshApiKeyState() {
+      setApiKeyAvailable(Boolean(getStoredVoiceApiKey()));
+    }
+
+    refreshApiKeyState();
+    window.addEventListener(VOICE_API_KEY_EVENT, refreshApiKeyState);
+    window.addEventListener("storage", refreshApiKeyState);
+    return () => {
+      window.removeEventListener(VOICE_API_KEY_EVENT, refreshApiKeyState);
+      window.removeEventListener("storage", refreshApiKeyState);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -142,6 +161,11 @@ export function VoiceAssistant() {
   async function sendToAgent(text: string) {
     const utterance = text.trim();
     if (!utterance) return;
+    const apiKey = getStoredVoiceApiKey();
+    if (!apiKey) {
+      setError("Add your OpenAI API key in Settings to use voice assistant.");
+      return;
+    }
 
     setError("");
     setProcessing(true);
@@ -152,15 +176,45 @@ export function VoiceAssistant() {
 
     try {
       const context = await buildContext();
-      const response = await fetch("/api/voice-agent", {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ utterance, context }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4.1-mini",
+          response_format: { type: "json_object" },
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content:
+                'You are Grain Voice, a finance voice assistant inside a personal finance tracker. Return ONLY valid JSON with this shape: {"reply": string, "action": {"type":"none"|"navigate"|"add_transaction","path"?:string,"transaction"?:{"amount":number,"type":"income"|"expense","categoryId":string,"walletId":string,"createdAt"?:string,"note"?:string}}}. Use the provided category and wallet ids exactly. Ask short follow-up questions if data is missing.',
+            },
+            {
+              role: "user",
+              content: JSON.stringify({ utterance, context }),
+            },
+          ],
+        }),
       });
-      const payload = (await response.json()) as VoiceAgentResponse & { error?: string };
+      const rawPayload = (await response.json()) as
+        | VoiceAgentResponse
+        | { error?: { message?: string } }
+        | { choices?: Array<{ message?: { content?: string } }> };
       if (!response.ok) {
-        throw new Error(payload.error ?? "Voice agent request failed.");
+        const message =
+          "error" in rawPayload && rawPayload.error?.message
+            ? rawPayload.error.message
+            : "Voice agent request failed.";
+        throw new Error(message);
       }
+
+      const payload =
+        "choices" in rawPayload
+          ? (JSON.parse(rawPayload.choices?.[0]?.message?.content ?? "{}") as VoiceAgentResponse)
+          : (rawPayload as VoiceAgentResponse);
 
       if (payload.action.type === "add_transaction" && payload.action.transaction) {
         await addTransaction(payload.action.transaction);
@@ -265,7 +319,9 @@ export function VoiceAssistant() {
             <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2">
               <Button
                 className="w-full"
-                disabled={listening || processing || !recognitionSupported}
+                disabled={
+                  listening || processing || !recognitionSupported || !apiKeyAvailable
+                }
                 onClick={startListening}
               >
                 {listening ? "Listening..." : "Start Voice Input"}
@@ -288,6 +344,11 @@ export function VoiceAssistant() {
             {!recognitionSupported ? (
               <p className="text-xs text-[var(--muted)]">
                 This browser does not support live microphone recognition. Typed fallback is available.
+              </p>
+            ) : null}
+            {!apiKeyAvailable ? (
+              <p className="text-xs text-[var(--muted)]">
+                Add your own OpenAI API key in Settings to enable voice assistant on this browser.
               </p>
             ) : null}
             {error ? <p className="text-sm text-[var(--danger)]">{error}</p> : null}

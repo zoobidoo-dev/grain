@@ -24,6 +24,11 @@ import {
   StatementPasswordError,
   type ParsedStatementRow,
 } from "@/lib/statement-import";
+import {
+  getStoredVoiceApiKey,
+  maskApiKey,
+  setStoredVoiceApiKey,
+} from "@/lib/voice-settings";
 import type { Category, ExportPayload, Preferences, Wallet } from "@/lib/types";
 
 export default function SettingsPage() {
@@ -46,6 +51,8 @@ export default function SettingsPage() {
   const [statementPassword, setStatementPassword] = useState("");
   const [statementPasswordError, setStatementPasswordError] = useState("");
   const [showStatementPasswordModal, setShowStatementPasswordModal] = useState(false);
+  const [voiceApiKeyInput, setVoiceApiKeyInput] = useState("");
+  const [savedVoiceApiKeyMask, setSavedVoiceApiKeyMask] = useState("Not configured");
 
   useEffect(() => {
     Promise.all([getPreferences(), getWallets(), getCategories()])
@@ -54,6 +61,7 @@ export default function SettingsPage() {
         setWallets(walletRows);
         setCategories(categoryRows);
         setStatementWalletId(prefs.defaultWalletId ?? walletRows[0]?.id ?? "");
+        setSavedVoiceApiKeyMask(maskApiKey(getStoredVoiceApiKey()));
       })
       .catch(() => undefined);
   }, []);
@@ -147,6 +155,52 @@ export default function SettingsPage() {
           >
             Replay Onboarding
           </Button>
+        </Card>
+
+        <Card className="space-y-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+            Voice Assistant Key
+          </p>
+          <p className="text-sm muted">
+            Paste your own OpenAI API key to use the voice assistant from this browser only.
+          </p>
+          <p className="text-xs muted">Current: {savedVoiceApiKeyMask}</p>
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              OpenAI API Key
+            </span>
+            <Input
+              type="password"
+              value={voiceApiKeyInput}
+              onChange={(event) => setVoiceApiKeyInput(event.target.value)}
+              placeholder="sk-proj-..."
+            />
+          </label>
+          <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2">
+            <Button
+              className="w-full"
+              onClick={() => {
+                setStoredVoiceApiKey(voiceApiKeyInput);
+                setSavedVoiceApiKeyMask(maskApiKey(getStoredVoiceApiKey()));
+                setVoiceApiKeyInput("");
+                setStatus("Voice assistant key saved in this browser.");
+              }}
+            >
+              Save Voice Key
+            </Button>
+            <Button
+              variant="secondary"
+              className="w-full"
+              onClick={() => {
+                setStoredVoiceApiKey("");
+                setSavedVoiceApiKeyMask(maskApiKey(""));
+                setVoiceApiKeyInput("");
+                setStatus("Voice assistant key removed from this browser.");
+              }}
+            >
+              Remove Voice Key
+            </Button>
+          </div>
         </Card>
 
         <Card className="space-y-3">
