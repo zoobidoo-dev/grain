@@ -93,8 +93,31 @@ export type Goal = {
   updatedAt: string;
 };
 
+export type DebtKind = "lent" | "borrowed" | "institutional";
+
+export type InstitutionalDebtSubtype = "loan" | "credit_card" | "other";
+
+export type DebtDirection = "owed_to_me" | "i_owe";
+
+export type DebtStatus = "open" | "settled";
+
+export type Debt = {
+  id: string;
+  title: string;
+  amount: number;
+  kind: DebtKind;
+  institutionalSubtype?: InstitutionalDebtSubtype;
+  direction: DebtDirection;
+  status: DebtStatus;
+  person?: string;
+  dueAt?: string;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ExportPayload = {
-  version: 2;
+  version: 2 | 3;
   exportedAt: string;
   categories: Category[];
   transactions: Transaction[];
@@ -103,5 +126,6 @@ export type ExportPayload = {
   wallets: Wallet[];
   transfers: Transfer[];
   goals: Goal[];
+  debts?: Debt[];
   preferences: Preferences;
 };

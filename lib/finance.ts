@@ -1,6 +1,7 @@
 import type {
   Budget,
   Category,
+  Debt,
   Goal,
   Transaction,
   Transfer,
@@ -290,4 +291,27 @@ export function parseSmartQuery(input: string): SmartQuery {
 export function goalProgress(goal: Goal) {
   if (!goal.targetAmount) return 0;
   return Math.min(1, goal.currentAmount / goal.targetAmount);
+}
+
+export function summarizeDebts(debts: Debt[]) {
+  let receivable = 0;
+  let payable = 0;
+  let openCount = 0;
+
+  for (const debt of debts) {
+    if (debt.status !== "open") continue;
+    openCount += 1;
+    if (debt.direction === "owed_to_me") {
+      receivable += debt.amount;
+    } else {
+      payable += debt.amount;
+    }
+  }
+
+  return {
+    receivable,
+    payable,
+    net: receivable - payable,
+    openCount,
+  };
 }

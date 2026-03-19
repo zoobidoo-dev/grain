@@ -7,6 +7,7 @@ import { Button } from "@/app/components/ui/Button";
 import { Card } from "@/app/components/ui/Card";
 import { ListRow } from "@/app/components/ui/ListRow";
 import {
+  getDebts,
   getBudgets,
   getCategories,
   getPreferences,
@@ -16,10 +17,11 @@ import {
   budgetProgress,
   categoryLabelMap,
   monthKey,
+  summarizeDebts,
   summarizeTransactions,
 } from "@/lib/finance";
 import { formatCurrency, formatDate } from "@/lib/format";
-import type { Budget, Category, Preferences, Transaction } from "@/lib/types";
+import type { Budget, Category, Debt, Preferences, Transaction } from "@/lib/types";
 
 function MatrixMeter({
   value,
@@ -100,6 +102,7 @@ export default function Home() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [budgets, setBudgets] = useState<Budget[]>([]);
+  const [debts, setDebts] = useState<Debt[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({
     id: "prefs",
     currency: "USD",
@@ -110,16 +113,18 @@ export default function Home() {
   useEffect(() => {
     async function load() {
       const month = monthKey();
-      const [txRows, categoryRows, prefs, budgetRows] = await Promise.all([
+      const [txRows, categoryRows, prefs, budgetRows, debtRows] = await Promise.all([
         getTransactions(),
         getCategories(),
         getPreferences(),
         getBudgets(month),
+        getDebts(),
       ]);
       setTransactions(txRows);
       setCategories(categoryRows);
       setPreferences(prefs);
       setBudgets(budgetRows);
+      setDebts(debtRows);
       setLoading(false);
     }
 
@@ -142,6 +147,14 @@ export default function Home() {
   const focusedBudgets = useMemo(
     () => budgetItems.filter((item) => item.progress >= 0.6).slice(0, 3),
     [budgetItems],
+  );
+  const personalDebtSummary = useMemo(
+    () => summarizeDebts(debts.filter((debt) => debt.kind !== "institutional")),
+    [debts],
+  );
+  const institutionalDebtSummary = useMemo(
+    () => summarizeDebts(debts.filter((debt) => debt.kind === "institutional")),
+    [debts],
   );
   const isEmptyState = !loading && transactions.length === 0;
 
@@ -284,6 +297,54 @@ export default function Home() {
               ))}
             </div>
           )}
+        </Card>
+
+        <Card className="space-y-3 transition-colors duration-200 hover:border-white/15">
+          <div className="flex items-center justify-between">
+            <p className="text-xs uppercase tracking-[0.12em] text-(--muted)">
+              Debts
+            </p>
+            <Link href="/debts" className="text-xs uppercase tracking-widest">
+              Open
+            </Link>
+          </div>
+          <div className="grid grid-cols-2 gap-3 border-y border-(--border) py-2 text-xs matrix-label">
+            <div>
+              <p className="text-(--muted)">Lent</p>
+              <p className="mt-1">
+                {formatCurrency(
+                  personalDebtSummary.receivable,
+                  preferences.locale,
+                  preferences.currency,
+                )}
+              </p>
+            </div>
+            <div>
+              <p className="text-(--muted)">Borrowed</p>
+              <p className="mt-1">
+                {formatCurrency(
+                  personalDebtSummary.payable,
+                  preferences.locale,
+                  preferences.currency,
+                )}
+              </p>
+            </div>
+            <div className="col-span-2 border-t border-(--border) pt-2">
+              <p className="text-(--muted)">Custom</p>
+              <p className="mt-1">
+                {formatCurrency(
+                  institutionalDebtSummary.payable,
+                  preferences.locale,
+                  preferences.currency,
+                )}
+              </p>
+            </div>
+          </div>
+          <p className="text-xs matrix-label muted-strong">
+            {personalDebtSummary.openCount || institutionalDebtSummary.openCount
+              ? `${personalDebtSummary.openCount} personal and ${institutionalDebtSummary.openCount} custom open records.`
+              : "Track lent money, borrowed money, and custom liabilities."}
+          </p>
         </Card>
 
       </section>

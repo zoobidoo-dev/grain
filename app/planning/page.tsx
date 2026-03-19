@@ -39,6 +39,11 @@ export default function PlanningPage() {
                 Goals
               </Button>
             </Link>
+            <Link href="/debts">
+              <Button variant="secondary" className="w-full">
+                Debts
+              </Button>
+            </Link>
           </div>
         </Card>
       </section>

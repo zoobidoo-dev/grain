@@ -7,8 +7,13 @@ import {
 import type {
   Budget,
   Category,
+  Debt,
+  DebtDirection,
+  DebtKind,
+  DebtStatus,
   ExportPayload,
   Goal,
+  InstitutionalDebtSubtype,
   Preferences,
   RecurringFrequency,
   RecurringTemplate,
@@ -86,6 +91,19 @@ type NewGoal = {
   deadline?: string;
 };
 
+type NewDebt = {
+  title: string;
+  amount: number;
+  kind: DebtKind;
+  institutionalSubtype?: InstitutionalDebtSubtype;
+  direction: DebtDirection;
+  status?: DebtStatus;
+  person?: string;
+  dueAt?: string;
+  note?: string;
+  createdAt?: string;
+};
+
 interface GrainDb extends DBSchema {
   transactions: {
     key: string;
@@ -124,10 +142,15 @@ interface GrainDb extends DBSchema {
     key: string;
     value: Goal;
   };
+  debts: {
+    key: string;
+    value: Debt;
+    indexes: { "by-createdAt": string; "by-status": DebtStatus };
+  };
 }
 
 const DB_NAME = "grain-db";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let dbPromise: Promise<IDBPDatabase<GrainDb>> | null = null;
 
@@ -146,6 +169,20 @@ function addInterval(isoDate: string, frequency: RecurringFrequency) {
     date.setMonth(date.getMonth() + 1);
   }
   return date.toISOString();
+}
+
+function normalizeDebt(row: Debt | (Omit<Debt, "kind"> & { kind: DebtKind | "custom" })) {
+  const kind = row.kind === "custom" ? "institutional" : row.kind;
+  return {
+    ...row,
+    kind,
+    institutionalSubtype:
+      kind === "institutional" ? row.institutionalSubtype ?? "other" : undefined,
+    direction:
+      kind === "institutional"
+        ? "i_owe"
+        : row.direction,
+  } as Debt;
 }
 
 async function getDb() {
@@ -188,6 +225,14 @@ async function getDb() {
           transfers.createIndex("by-createdAt", "createdAt");
 
           db.createObjectStore("goals", { keyPath: "id" });
+        }
+
+        if (oldVersion < 3) {
+          const debts = db.createObjectStore("debts", {
+            keyPath: "id",
+          });
+          debts.createIndex("by-createdAt", "createdAt");
+          debts.createIndex("by-status", "status");
         }
       },
     });
@@ -727,10 +772,78 @@ export async function deleteGoal(id: string) {
   await db.delete("goals", id);
 }
 
+export async function getDebts() {
+  const db = await getDb();
+  const rows = await db.getAll("debts");
+  return rows
+    .map((row) => normalizeDebt(row))
+    .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1));
+}
+
+export async function addDebt(input: NewDebt) {
+  const db = await getDb();
+  const now = input.createdAt ?? new Date().toISOString();
+  const row: Debt = {
+    id: generateId(),
+    title: input.title.trim(),
+    amount: input.amount,
+    kind: input.kind,
+    institutionalSubtype:
+      input.kind === "institutional" ? input.institutionalSubtype ?? "other" : undefined,
+    direction: input.direction,
+    status: input.status ?? "open",
+    person: input.person?.trim() || undefined,
+    dueAt: input.dueAt,
+    note: input.note?.trim() || undefined,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db.put("debts", row);
+  return row;
+}
+
+export async function updateDebt(
+  id: string,
+  input: Partial<Omit<Debt, "id" | "createdAt" | "updatedAt">>,
+) {
+  const db = await getDb();
+  const existing = await db.get("debts", id);
+  if (!existing) return null;
+  const next: Debt = {
+    ...existing,
+    ...input,
+    title: input.title?.trim() ?? existing.title,
+    institutionalSubtype:
+      (input.kind ?? existing.kind) === "institutional"
+        ? input.institutionalSubtype ?? existing.institutionalSubtype ?? "other"
+        : undefined,
+    person: "person" in input ? input.person?.trim() || undefined : existing.person,
+    note: "note" in input ? input.note?.trim() || undefined : existing.note,
+    updatedAt: new Date().toISOString(),
+  };
+  const normalized = normalizeDebt(next);
+  await db.put("debts", normalized);
+  return normalized;
+}
+
+export async function deleteDebt(id: string) {
+  const db = await getDb();
+  await db.delete("debts", id);
+}
+
 export async function exportData(): Promise<ExportPayload> {
   const db = await getDb();
-  const [categories, transactions, preferences, budgets, recurringTemplates, wallets, transfers, goals] =
-    await Promise.all([
+  const [
+    categories,
+    transactions,
+    preferences,
+    budgets,
+    recurringTemplates,
+    wallets,
+    transfers,
+    goals,
+    debts,
+  ] = await Promise.all([
     db.getAll("categories"),
     db.getAll("transactions"),
     db.get("preferences", "prefs"),
@@ -739,10 +852,11 @@ export async function exportData(): Promise<ExportPayload> {
     db.getAll("wallets"),
     db.getAll("transfers"),
     db.getAll("goals"),
+    db.getAll("debts"),
   ]);
 
   return {
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     categories,
     transactions,
@@ -751,6 +865,7 @@ export async function exportData(): Promise<ExportPayload> {
     wallets,
     transfers,
     goals,
+    debts: debts.map((row) => normalizeDebt(row)),
     preferences: preferences ?? DEFAULT_PREFERENCES,
   };
 }
@@ -767,6 +882,7 @@ export async function importData(payload: ExportPayload) {
       "wallets",
       "transfers",
       "goals",
+      "debts",
     ],
     "readwrite",
   );
@@ -778,6 +894,7 @@ export async function importData(payload: ExportPayload) {
   await tx.objectStore("wallets").clear();
   await tx.objectStore("transfers").clear();
   await tx.objectStore("goals").clear();
+  await tx.objectStore("debts").clear();
 
   for (const category of payload.categories) {
     await tx.objectStore("categories").put(category);
@@ -800,6 +917,9 @@ export async function importData(payload: ExportPayload) {
   for (const goal of payload.goals ?? []) {
     await tx.objectStore("goals").put(goal);
   }
+  for (const debt of payload.debts ?? []) {
+    await tx.objectStore("debts").put(normalizeDebt(debt as Debt));
+  }
   await tx.objectStore("preferences").put(payload.preferences);
   await tx.done;
 }
@@ -816,6 +936,7 @@ export async function resetData() {
       "wallets",
       "transfers",
       "goals",
+      "debts",
     ],
     "readwrite",
   );
@@ -827,6 +948,7 @@ export async function resetData() {
   await tx.objectStore("wallets").clear();
   await tx.objectStore("transfers").clear();
   await tx.objectStore("goals").clear();
+  await tx.objectStore("debts").clear();
   for (const category of DEFAULT_CATEGORIES) {
     await tx.objectStore("categories").put(category);
   }
