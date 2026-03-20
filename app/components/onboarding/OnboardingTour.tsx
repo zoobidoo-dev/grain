@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Button } from "@/app/components/ui/Button";
 import { Modal } from "@/app/components/ui/Modal";
+import { readLocalStorage, writeLocalStorage } from "@/lib/browser-storage";
 import {
   ONBOARDING_START_EVENT,
   ONBOARDING_STORAGE_KEY,
@@ -139,7 +140,7 @@ export function OnboardingTour() {
   }, [pathname]);
 
   const markSeen = useCallback(() => {
-    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+    writeLocalStorage(ONBOARDING_STORAGE_KEY, "1");
   }, []);
 
   const goToStep = useCallback(
@@ -166,7 +167,7 @@ export function OnboardingTour() {
   }, [markSeen]);
 
   useEffect(() => {
-    const hasSeen = window.localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1";
+    const hasSeen = readLocalStorage(ONBOARDING_STORAGE_KEY) === "1";
     if (hasSeen) return;
     const timer = window.setTimeout(() => startTour(), 0);
     return () => window.clearTimeout(timer);

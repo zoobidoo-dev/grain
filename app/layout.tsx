@@ -5,6 +5,7 @@ import { BottomNav } from "@/app/components/BottomNav";
 import { OnboardingTour } from "@/app/components/onboarding/OnboardingTour";
 import { InstallPrompt } from "@/app/components/pwa/InstallPrompt";
 import { ServiceWorkerRegistration } from "@/app/components/pwa/ServiceWorkerRegistration";
+import { ClientBoundary } from "@/app/components/ui/ClientBoundary";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -38,9 +39,13 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <ServiceWorkerRegistration />
-        <InstallPrompt />
+        <ClientBoundary label="InstallPrompt">
+          <InstallPrompt />
+        </ClientBoundary>
         <AppShell>{children}</AppShell>
-        <OnboardingTour />
+        <ClientBoundary label="OnboardingTour">
+          <OnboardingTour />
+        </ClientBoundary>
         <BottomNav />
       </body>
     </html>

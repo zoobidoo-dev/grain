@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { readLocalStorage, writeLocalStorage } from "@/lib/browser-storage";
 
 type InstallChoice = {
   outcome: "accepted" | "dismissed";
@@ -30,10 +31,9 @@ export function InstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalled, setIsInstalled] = useState(() => isStandaloneMode());
-  const [isDismissed, setIsDismissed] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem(DISMISS_STORAGE_KEY) === "1";
-  });
+  const [isDismissed, setIsDismissed] = useState(
+    () => readLocalStorage(DISMISS_STORAGE_KEY) === "1",
+  );
 
   useEffect(() => {
     if (isInstalled || isDismissed) {
@@ -79,10 +79,7 @@ export function InstallPrompt() {
   const onDismissClick = () => {
     setIsDismissed(true);
     setDeferredPrompt(null);
-
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(DISMISS_STORAGE_KEY, "1");
-    }
+    writeLocalStorage(DISMISS_STORAGE_KEY, "1");
   };
 
   if (!deferredPrompt) {
