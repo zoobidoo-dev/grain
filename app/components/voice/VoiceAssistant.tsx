@@ -23,6 +23,10 @@ import {
 import { monthKey, summarizeTransactions } from "@/lib/finance";
 import { formatRealtimeVoiceError } from "@/lib/voice-errors";
 import {
+  normalizeDateInput,
+  parseDateInput,
+} from "@/lib/format";
+import {
   getStoredVoiceApiKey,
   getStoredVoiceLanguage,
   normalizeVoiceTranscriptionLanguage,
@@ -155,6 +159,7 @@ function validateDraft(
 ) {
   if (!draft.amount || draft.amount <= 0) return false;
   if (draft.type !== "income" && draft.type !== "expense") return false;
+  if (!draft.createdAt || !parseDateInput(draft.createdAt)) return false;
   if (!draft.categoryId || !context.categories.some((item) => item.id === draft.categoryId)) {
     return false;
   }
@@ -230,6 +235,41 @@ export function VoiceAssistant() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const connected = connectionPhase === "connected";
   const processing = connectionPhase === "connecting" || connectionPhase === "closing";
+
+  function mergeDraftUpdate(input: {
+    amount?: number;
+    type?: TransactionType;
+    categoryId?: string;
+    walletId?: string;
+    createdAt?: string;
+    note?: string;
+    awaitingConfirmation?: boolean;
+    clearDraft?: boolean;
+  }) {
+    const nextDraft: PendingTransactionDraft = {
+      ...pendingTransactionRef.current,
+    };
+
+    if (input.amount !== undefined) nextDraft.amount = input.amount;
+    if (input.type !== undefined) nextDraft.type = input.type;
+    if (input.categoryId !== undefined) nextDraft.categoryId = input.categoryId;
+    if (input.walletId !== undefined) nextDraft.walletId = input.walletId;
+    if (input.note !== undefined) nextDraft.note = input.note;
+    if (input.awaitingConfirmation !== undefined) {
+      nextDraft.awaitingConfirmation = input.awaitingConfirmation;
+    }
+
+    if (input.createdAt !== undefined) {
+      const normalizedDate = parseDateInput(input.createdAt);
+      if (normalizedDate) {
+        nextDraft.createdAt = normalizedDate;
+      } else {
+        delete nextDraft.createdAt;
+      }
+    }
+
+    return nextDraft;
+  }
 
   useEffect(() => {
     openRef.current = open;
@@ -345,13 +385,7 @@ export function VoiceAssistant() {
               return "Transaction draft cleared.";
             }
 
-            const nextDraft: PendingTransactionDraft = {
-              ...pendingTransactionRef.current,
-              ...Object.fromEntries(
-                Object.entries(input).filter(([, value]) => value !== undefined),
-              ),
-            };
-            delete (nextDraft as { clearDraft?: boolean }).clearDraft;
+            const nextDraft = mergeDraftUpdate(input);
             const liveContext = await buildAssistantContext(pathname, nextDraft);
             const missing = missingDraftFields(nextDraft, liveContext);
             const updatedDraft: PendingTransactionDraft = {
@@ -391,14 +425,14 @@ export function VoiceAssistant() {
             if (!validateDraft(currentDraft, liveContext)) {
               return `Cannot save yet. Missing ${missingDraftFields(currentDraft, liveContext).join(", ")}.`;
             }
-            await addTransaction({
-              amount: currentDraft.amount!,
-              type: currentDraft.type!,
-              categoryId: currentDraft.categoryId!,
-              walletId: currentDraft.walletId!,
-              createdAt: currentDraft.createdAt,
-              note: currentDraft.note,
-            });
+              await addTransaction({
+                amount: currentDraft.amount!,
+                type: currentDraft.type!,
+                categoryId: currentDraft.categoryId!,
+                walletId: currentDraft.walletId!,
+                createdAt: normalizeDateInput(currentDraft.createdAt),
+                note: currentDraft.note,
+              });
             const summary = formatDraftSummary(currentDraft, liveContext);
             setPendingTransaction({});
             pendingTransactionRef.current = {};
@@ -438,6 +472,7 @@ Important rules:
 - Do not ask again for fields that are already present in the draft.
 - Ask only for the missing fields.
 - Save only after clear confirmation like yes, sure, okay, save it, go ahead, haan.
+- When you set createdAt, always pass a valid ISO 8601 date-time string. Convert relative dates like today or yesterday before calling tools.
 - If the user asks about history or insights, answer briefly and navigate when useful.
 - Reply in the same language as the user when possible.
 
