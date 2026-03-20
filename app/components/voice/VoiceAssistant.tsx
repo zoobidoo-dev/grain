@@ -1,5 +1,6 @@
 "use client";
 
+import * as Sentry from "@sentry/nextjs";
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { z } from "zod";
@@ -26,6 +27,7 @@ import {
   normalizeDateInput,
   parseDateInput,
 } from "@/lib/format";
+import { getClientMonitoringTags } from "@/lib/monitoring";
 import {
   getStoredVoiceApiKey,
   getStoredVoiceLanguage,
@@ -236,6 +238,41 @@ export function VoiceAssistant() {
   const connected = connectionPhase === "connected";
   const processing = connectionPhase === "connecting" || connectionPhase === "closing";
 
+  function addVoiceBreadcrumb(
+    message: string,
+    data?: Record<string, string | number | boolean | null | undefined>,
+    level: "info" | "error" = "info",
+  ) {
+    Sentry.addBreadcrumb({
+      category: "voice",
+      message,
+      level,
+      data,
+    });
+  }
+
+  function captureVoiceException(
+    stage: string,
+    nextError: unknown,
+    data?: Record<string, string | number | boolean | null | undefined>,
+  ) {
+    const error =
+      nextError instanceof Error ? nextError : new Error(formatRealtimeVoiceError(nextError));
+
+    Sentry.withScope((scope) => {
+      for (const [key, value] of Object.entries(getClientMonitoringTags())) {
+        scope.setTag(key, value);
+      }
+      scope.setTag("voice_stage", stage);
+      scope.setContext("voice", {
+        pathname,
+        connectionPhase,
+        ...data,
+      });
+      Sentry.captureException(error);
+    });
+  }
+
   function mergeDraftUpdate(input: {
     amount?: number;
     type?: TransactionType;
@@ -356,6 +393,7 @@ export function VoiceAssistant() {
 
     setError("");
     setConnectionPhase("connecting");
+    addVoiceBreadcrumb("connect_start", { pathname });
 
     for (let attempt = 0; attempt < CONNECT_RETRY_DELAYS_MS.length + 1; attempt += 1) {
       if (sessionGeneration !== sessionGenerationRef.current || !openRef.current) return;
@@ -397,6 +435,14 @@ export function VoiceAssistant() {
             }
             setPendingTransaction(updatedDraft);
             pendingTransactionRef.current = updatedDraft;
+            addVoiceBreadcrumb("draft_updated", {
+              hasAmount: Boolean(updatedDraft.amount),
+              hasType: Boolean(updatedDraft.type),
+              hasCategory: Boolean(updatedDraft.categoryId),
+              hasWallet: Boolean(updatedDraft.walletId),
+              hasDate: Boolean(updatedDraft.createdAt),
+              awaitingConfirmation: Boolean(updatedDraft.awaitingConfirmation),
+            });
             return missing.length
               ? `Draft updated. Missing ${missing.join(", ")}.`
               : `Draft updated: ${formatDraftSummary(updatedDraft, liveContext)}.`;
@@ -425,6 +471,15 @@ export function VoiceAssistant() {
             if (!validateDraft(currentDraft, liveContext)) {
               return `Cannot save yet. Missing ${missingDraftFields(currentDraft, liveContext).join(", ")}.`;
             }
+            addVoiceBreadcrumb("save_attempted", {
+              hasAmount: Boolean(currentDraft.amount),
+              hasType: Boolean(currentDraft.type),
+              hasCategory: Boolean(currentDraft.categoryId),
+              hasWallet: Boolean(currentDraft.walletId),
+              hasDate: Boolean(currentDraft.createdAt),
+              type: currentDraft.type ?? null,
+            });
+            try {
               await addTransaction({
                 amount: currentDraft.amount!,
                 type: currentDraft.type!,
@@ -433,9 +488,21 @@ export function VoiceAssistant() {
                 createdAt: normalizeDateInput(currentDraft.createdAt),
                 note: currentDraft.note,
               });
+            } catch (nextError) {
+              addVoiceBreadcrumb("save_failed", { type: currentDraft.type ?? null }, "error");
+              captureVoiceException("save_transaction_draft", nextError, {
+                hasAmount: Boolean(currentDraft.amount),
+                hasCategory: Boolean(currentDraft.categoryId),
+                hasWallet: Boolean(currentDraft.walletId),
+                hasDate: Boolean(currentDraft.createdAt),
+                type: currentDraft.type ?? null,
+              });
+              throw nextError;
+            }
             const summary = formatDraftSummary(currentDraft, liveContext);
             setPendingTransaction({});
             pendingTransactionRef.current = {};
+            addVoiceBreadcrumb("save_succeeded", { type: currentDraft.type ?? null });
             router.push("/transactions");
             return `Saved ${summary}.`;
           },
@@ -524,6 +591,8 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         });
         session.on("error", (nextError) => {
           if (!isCurrentSession()) return;
+          addVoiceBreadcrumb("session_error", undefined, "error");
+          captureVoiceException("session_error", nextError.error);
           teardownRealtimeSession({ clearTranscript: false, clearError: false, nextPhase: "failed" });
           setError(formatRealtimeVoiceError(nextError.error));
         });
@@ -538,6 +607,7 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
           session.close();
           return;
         }
+        addVoiceBreadcrumb("connect_success", { pathname, attempt: attempt + 1 });
         setConnectionPhase("connected");
         return;
       } catch (nextError) {
@@ -547,6 +617,8 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
         }
         const stillActive = sessionGeneration === sessionGenerationRef.current && openRef.current;
         if (!stillActive) return;
+        addVoiceBreadcrumb("connect_failed", { pathname, attempt: attempt + 1 }, "error");
+        captureVoiceException("connect_realtime", nextError, { attempt: attempt + 1 });
         if (attempt < CONNECT_RETRY_DELAYS_MS.length) {
           setConnectionPhase("connecting");
           setError(formatRealtimeVoiceError(nextError));
@@ -588,7 +660,10 @@ Current month summary: income ${initialContext.monthlySummary.income}, expenses 
       <button
         type="button"
         className="voice-agent-trigger matrix-label"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          addVoiceBreadcrumb("open_modal", { pathname });
+          setOpen(true);
+        }}
         aria-label="Open voice assistant"
         title="Open voice assistant"
       >
